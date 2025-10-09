@@ -123,6 +123,7 @@ func (c *Consumer) LaunchJob(key, queue string, job Job, param ...Param) {
 	}
 }
 
+// LaunchTopicJob  group: 即队列名, topic: routing key
 func (c *Consumer) LaunchTopicJob(group string, topic string, job Job) {
 
 	if group == "" {
