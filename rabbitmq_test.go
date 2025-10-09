@@ -12,7 +12,7 @@ func Test_Rabbitmq(t *testing.T) {
 	groupV2 := "test-group-v2"
 
 	opt := &ExchangeOption{
-		Name: "test-topic--exchange",
+		Name: "test-topic-exchange",
 		Type: "topic",
 	}
 	brokerUrl := "amqp://MjpyYWJiaXRtcS1jbi1xem00ZHNrN2IwNjpMVEFJNXRRSHF0djFXYkN4NXB4YXk2TEw=:MEVGOEFBODlCRDBCN0NBNjJEMjU5NTI1REYxOTU1MTdBODk1MTFFRToxNzU3MDQzNjczOTM0@rabbitmq-cn-qzm4dsk7b06-cn-hangzhou-amqp-46-net.mq.amqp.aliyuncs.com"
