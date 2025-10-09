@@ -51,7 +51,7 @@ func Test_Rabbitmq(t *testing.T) {
 			return nil
 		}
 
-		consumer.LaunchTopicJob(topic, group, job)
+		consumer.LaunchTopicJob(group, topic, job)
 	}()
 
 	go func() {
@@ -60,7 +60,7 @@ func Test_Rabbitmq(t *testing.T) {
 			return nil
 		}
 
-		consumer.LaunchTopicJob(topic, group, job)
+		consumer.LaunchTopicJob(group, topic, job)
 	}()
 
 	go func() {
@@ -68,7 +68,7 @@ func Test_Rabbitmq(t *testing.T) {
 			t.Logf("group: %s, consumerV1 receive msg: %s", groupV1, body)
 			return nil
 		}
-		consumer.LaunchTopicJob(topic, groupV1, job)
+		consumer.LaunchTopicJob(groupV1, topic, job)
 	}()
 
 	go func() {
@@ -76,12 +76,12 @@ func Test_Rabbitmq(t *testing.T) {
 			t.Logf("group: %s, consumer receive msg: %s", groupV2, body)
 			return nil
 		}
-		consumer.LaunchTopicJob(topic, groupV2, job)
+		consumer.LaunchTopicJob(groupV2, topic, job)
 	}()
 
 	job := func(body []byte) error {
 		t.Logf("group: %s, consumer receive msg: %s", groupV1, body)
 		return nil
 	}
-	consumer.LaunchTopicJob(topic, groupV1, job)
+	consumer.LaunchTopicJob(groupV1, topic, job)
 }

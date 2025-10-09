@@ -123,7 +123,11 @@ func (c *Consumer) LaunchJob(key, queue string, job Job, param ...Param) {
 	}
 }
 
-func (c *Consumer) LaunchTopicJob(topic string, group string, job Job) {
+func (c *Consumer) LaunchTopicJob(group string, topic string, job Job) {
+
+	if group == "" {
+		panic("group is empty")
+	}
 
 	opt := &broker.GroupConsumeOption{
 		Group:       group,
