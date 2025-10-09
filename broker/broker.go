@@ -1,4 +1,3 @@
-
 package broker
 
 type Status int
@@ -17,8 +16,8 @@ type Queue struct {
 
 type Broker interface {
 	Consume(queue *Queue) error
+	ConsumerTopic(opt *GroupConsumeOption, handle func([]byte) Status) error
 	Publish(key string, body []byte) error
 	PublishDelay(queue string, body []byte, delay int64) error
 	Health() bool
 }
-

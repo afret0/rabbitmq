@@ -1,4 +1,3 @@
-
 package broker
 
 import (
@@ -124,6 +123,74 @@ func (a *AmqpBroker) Consume(queue *Queue) error {
 			}
 		}
 	}
+}
+
+type GroupConsumeOption struct {
+	Group       string   // 消费组名（同组共享队列）
+	RoutingKeys []string // 需要订阅的多个 topic / pattern
+	Prefetch    int      // 每实例并行未 Ack 上限
+}
+
+func (a *AmqpBroker) ConsumerTopic(opt *GroupConsumeOption, handle func([]byte) Status) error {
+	if a.conn == nil {
+		return fmt.Errorf("conn is nil")
+	}
+	if opt.Group == "" || len(opt.RoutingKeys) == 0 {
+		return fmt.Errorf("group or routing keys empty")
+	}
+
+	ch, err := a.conn.Channel()
+	if err != nil {
+		return err
+	}
+	defer ch.Close()
+
+	// 1. 声明 topic exchange（幂等）
+	if err := ch.ExchangeDeclare(a.options.Exchange, a.options.ExchangeType, true, false, false, false, nil); err != nil {
+		return err
+	}
+
+	// 2. 队列名（同组保证一致）
+	queueName := opt.Group
+
+	// 3. 声明共享队列（持久化, 不自动删除）
+	if _, err := ch.QueueDeclare(queueName, true, false, false, false, nil); err != nil {
+		return err
+	}
+
+	// 4. 绑定多个 routing key（可含 \* 或 \# 通配）
+	for _, rk := range opt.RoutingKeys {
+		if err := ch.QueueBind(queueName, rk, a.options.Exchange, false, nil); err != nil {
+			return err
+		}
+	}
+
+	// 5. QoS
+	prefetch := opt.Prefetch
+	if prefetch <= 0 {
+		prefetch = 10
+	}
+	if err := ch.Qos(prefetch, 0, false); err != nil {
+		return err
+	}
+
+	// 6. 开始消费（手动 Ack）
+	delivery, err := ch.Consume(queueName, "", false, false, false, false, nil)
+	if err != nil {
+		return err
+	}
+
+	for d := range delivery {
+		retry := handle(d.Body)
+		if retry == Retry {
+			// 可接你现有的延迟重试逻辑
+			d.Nack(false, true) // 直接 requeue 简易重试（可能导致顺序抖动）
+			continue
+		}
+		d.Ack(false)
+	}
+
+	return nil
 }
 
 func (a *AmqpBroker) retry(queue *Queue, d amqp.Delivery) error {

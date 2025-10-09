@@ -3,11 +3,13 @@ package rabbitmq
 import (
 	"errors"
 	"fmt"
-	"github.com/afret0/rabbitmq/broker"
-	"github.com/afret0/rabbitmq/help"
 	"log"
 	"net/http"
 	"time"
+
+	"github.com/afret0/rabbitmq/broker"
+	"github.com/afret0/rabbitmq/help"
+	"github.com/afret0/wheel/tool"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -118,6 +120,33 @@ func (c *Consumer) LaunchJob(key, queue string, job Job, param ...Param) {
 			log.Printf("job %s consume error: %v ,retrying consume after 30s", queue, err)
 			time.Sleep(30 * time.Second)
 		}
+	}
+}
+
+func (c *Consumer) LaunchTopicJob(topic string, group string, job Job) {
+
+	opt := &broker.GroupConsumeOption{
+		Group:       group,
+		RoutingKeys: []string{topic},
+		Prefetch:    10,
+	}
+
+	handle := func(body []byte) broker.Status {
+		switch err := job(body); err {
+		case RetryError:
+			return broker.Retry
+		default:
+			return broker.Success
+		}
+	}
+
+	for {
+		log.Printf("group: %s, topic: %s, hostId: %s, start consume...", group, topic, tool.HostId())
+		if err := c.broker.ConsumerTopic(opt, handle); err != nil {
+			log.Printf("group: %s, topic: %s, hostId: %s, consume error: %v ,retrying consume after 30s", group, topic, tool.HostId(), err)
+			time.Sleep(30 * time.Second)
+		}
+
 	}
 }
 
