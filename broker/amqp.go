@@ -182,7 +182,7 @@ func (a *AmqpBroker) ConsumerTopic(opt *GroupConsumeOption, handle func([]byte) 
 	}
 
 	for d := range delivery {
-		if debug := os.Getenv("DEBUG"); debug == "true" {
+		if debug := os.Getenv("DEBUG"); debug == "TRUE" {
 			log.Printf("AmqpBroker ConsumerTopic receive msg: %s", d.Body)
 		}
 		retry := handle(d.Body)
