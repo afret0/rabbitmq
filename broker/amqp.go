@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -181,6 +182,9 @@ func (a *AmqpBroker) ConsumerTopic(opt *GroupConsumeOption, handle func([]byte) 
 	}
 
 	for d := range delivery {
+		if debug := os.Getenv("DEBUG"); debug == "true" {
+			log.Printf("AmqpBroker ConsumerTopic receive msg: %s", d.Body)
+		}
 		retry := handle(d.Body)
 		if retry == Retry {
 			// 可接你现有的延迟重试逻辑
