@@ -3,7 +3,7 @@ module github.com/afret0/rabbitmq
 go 1.22.4
 
 require (
-	github.com/afret0/wheel v1.1.30
+	github.com/afret0/wheel v1.1.38
 	github.com/prometheus/client_golang v1.20.4
 	github.com/streadway/amqp v1.1.0
 )

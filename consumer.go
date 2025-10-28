@@ -137,6 +137,10 @@ func (c *Consumer) LaunchTopicJob(group string, topic string, job Job) {
 	}
 
 	handle := func(body []byte) broker.Status {
+		if tool.Debug() {
+			log.Printf("group: %s, topic: %s, hostId: %s, receive msg: %s", group, topic, tool.HostId(), body)
+		}
+
 		switch err := job(body); err {
 		case RetryError:
 			return broker.Retry
