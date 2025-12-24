@@ -1,7 +1,9 @@
 package rabbitmq
 
 import (
+	"context"
 	"encoding/json"
+
 	"github.com/afret0/rabbitmq/broker"
 )
 
@@ -23,7 +25,7 @@ func NewProducer(opt *ProducerOptions) *Producer {
 	return &Producer{broker: broker}
 }
 
-func (p *Producer) Publish(key string, data interface{}) error {
+func (p *Producer) Publish(ctx context.Context, key string, data interface{}) error {
 	var body []byte
 	switch d := data.(type) {
 	case string:
@@ -35,10 +37,10 @@ func (p *Producer) Publish(key string, data interface{}) error {
 		}
 		body = b
 	}
-	return p.broker.Publish(key, body)
+	return p.broker.Publish(ctx, key, body)
 }
 
-func (p *Producer) PublishDelay(key string, data interface{}, delay int64) error {
+func (p *Producer) PublishDelay(ctx context.Context, key string, data interface{}, delay int64) error {
 	var body []byte
 	switch d := data.(type) {
 	case string:
@@ -50,5 +52,5 @@ func (p *Producer) PublishDelay(key string, data interface{}, delay int64) error
 		}
 		body = b
 	}
-	return p.broker.PublishDelay(key, body, delay)
+	return p.broker.PublishDelay(ctx, key, body, delay)
 }
