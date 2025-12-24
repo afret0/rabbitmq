@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -8,7 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/afret0/wheel/tool"
 	"github.com/streadway/amqp"
+	"go.opentelemetry.io/otel"
 )
 
 type AmqpBrokerOptions struct {
@@ -232,7 +235,7 @@ func (a *AmqpBroker) retry(queue *Queue, d amqp.Delivery) error {
 	})
 }
 
-func (a *AmqpBroker) Publish(key string, body []byte) error {
+func (a *AmqpBroker) Publish(ctx context.Context, key string, body []byte) error {
 	channel, err := a.conn.Channel()
 	if err != nil {
 		return err
@@ -247,15 +250,22 @@ func (a *AmqpBroker) Publish(key string, body []byte) error {
 		return err
 	}
 
+	hds := amqp.Table{"opId": tool.OpId(ctx)}
+	if tool.EnvEnabled("TRACE") {
+		tracer := otel.Tracer("rabbitmq")
+		_, span := tracer.Start(ctx, "rabbitmq.publish")
+		defer span.End()
+	}
+
 	return channel.Publish(a.options.Exchange, key, false, false, amqp.Publishing{
-		Headers:      amqp.Table{},
+		Headers:      hds,
 		ContentType:  "",
 		Body:         body,
 		DeliveryMode: amqp.Persistent,
 	})
 }
 
-func (a *AmqpBroker) PublishDelay(queue string, body []byte, delay int64) error {
+func (a *AmqpBroker) PublishDelay(ctx context.Context, queue string, body []byte, delay int64) error {
 	channel, err := a.conn.Channel()
 	if err != nil {
 		return err
@@ -264,13 +274,22 @@ func (a *AmqpBroker) PublishDelay(queue string, body []byte, delay int64) error 
 
 	delayQ := fmt.Sprintf("delay.%d.%s.%s", delay, a.options.Exchange, queue)
 
+	hd := amqp.Table{
+		"opId":                      tool.OpId(ctx),
+		"x-dead-letter-exchange":    a.options.Exchange,
+		"x-dead-letter-routing-key": queue,
+		"x-message-ttl":             delay * 1000,
+		"x-expires":                 delay * 2 * 1000,
+	}
+
+	if tool.EnvEnabled("TRACE") {
+		tracer := otel.Tracer("rabbitmq")
+		_, span := tracer.Start(ctx, "rabbitmq.publish")
+		defer span.End()
+	}
+
 	if _, err := channel.QueueDeclare(delayQ,
-		true, true, false, false, amqp.Table{
-			"x-dead-letter-exchange":    a.options.Exchange,
-			"x-dead-letter-routing-key": queue,
-			"x-message-ttl":             delay * 1000,
-			"x-expires":                 delay * 2 * 1000,
-		},
+		true, true, false, false, hd,
 	); err != nil {
 		return err
 	}
