@@ -12,6 +12,7 @@ import (
 	"github.com/afret0/wheel/tool"
 	"github.com/streadway/amqp"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type AmqpBrokerOptions struct {
@@ -250,11 +251,18 @@ func (a *AmqpBroker) Publish(ctx context.Context, key string, body []byte) error
 		return err
 	}
 
-	hds := amqp.Table{"opId": tool.OpId(ctx)}
+	opId := tool.OpId(ctx)
+	hds := amqp.Table{"opId": opId}
 	if tool.EnvEnabled("TRACE") {
 		tracer := otel.Tracer("rabbitmq")
-		_, span := tracer.Start(ctx, "rabbitmq.publish")
+		_, span := tracer.Start(ctx, "rabbitmq.Publish")
 		defer span.End()
+		span.SetAttributes(
+			attribute.String("exchange", a.options.Exchange),
+			attribute.String("exchange_type", a.options.ExchangeType),
+			attribute.String("routing_key", key),
+			attribute.String("opId", opId),
+		)
 	}
 
 	return channel.Publish(a.options.Exchange, key, false, false, amqp.Publishing{
@@ -274,8 +282,9 @@ func (a *AmqpBroker) PublishDelay(ctx context.Context, queue string, body []byte
 
 	delayQ := fmt.Sprintf("delay.%d.%s.%s", delay, a.options.Exchange, queue)
 
+	opId := tool.OpId(ctx)
 	hd := amqp.Table{
-		"opId":                      tool.OpId(ctx),
+		"opId":                      opId,
 		"x-dead-letter-exchange":    a.options.Exchange,
 		"x-dead-letter-routing-key": queue,
 		"x-message-ttl":             delay * 1000,
@@ -284,8 +293,14 @@ func (a *AmqpBroker) PublishDelay(ctx context.Context, queue string, body []byte
 
 	if tool.EnvEnabled("TRACE") {
 		tracer := otel.Tracer("rabbitmq")
-		_, span := tracer.Start(ctx, "rabbitmq.publish")
+		_, span := tracer.Start(ctx, "rabbitmq.PublishDelay")
 		defer span.End()
+		span.SetAttributes(
+			attribute.String("exchange", a.options.Exchange),
+			attribute.String("exchange_type", a.options.ExchangeType),
+			attribute.String("queue", queue),
+			attribute.String("opId", opId),
+		)
 	}
 
 	if _, err := channel.QueueDeclare(delayQ,
