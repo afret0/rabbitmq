@@ -1,5 +1,7 @@
 package broker
 
+import "context"
+
 type Status int
 
 const (
@@ -17,7 +19,7 @@ type Queue struct {
 type Broker interface {
 	Consume(queue *Queue) error
 	ConsumerTopic(opt *GroupConsumeOption, handle func([]byte) Status) error
-	Publish(key string, body []byte) error
-	PublishDelay(queue string, body []byte, delay int64) error
+	Publish(ctx context.Context, key string, body []byte) error
+	PublishDelay(ctx context.Context, queue string, body []byte, delay int64) error
 	Health() bool
 }
