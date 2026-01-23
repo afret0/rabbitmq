@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/afret0/rabbitmq/broker"
-	"github.com/afret0/rabbitmq/help"
 	"github.com/afret0/wheel/tool"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -54,47 +53,50 @@ func NewConsumer(opt *ConsumerOptions) *Consumer {
 
 type Job func([]byte) error
 
-type params struct {
-	retryQueue []int64
-}
+//type params struct {
+//	retryQueue []int64
+//}
+//
+//type Param func(*params)
 
-type Param func(*params)
+//func Retry(strategy help.RetryStrategy, retry help.Retry) Param {
+//	return func(p *params) {
+//		if strategy == help.CUSTOMQUEUE {
+//			for _, delay := range retry.Queue {
+//				d, err := time.ParseDuration(delay)
+//				if err != nil {
+//					panic(err)
+//				}
+//				p.retryQueue = append(p.retryQueue, int64(d/time.Millisecond))
+//			}
+//			return
+//		}
+//		d, err := time.ParseDuration(retry.Delay)
+//		if err != nil {
+//			panic(err)
+//		}
+//		p.retryQueue = help.GetRetryQueue(int64(d/time.Millisecond), retry.Max, strategy)
+//	}
+//}
 
-func Retry(strategy help.RetryStrategy, retry help.Retry) Param {
-	return func(p *params) {
-		if strategy == help.CUSTOMQUEUE {
-			for _, delay := range retry.Queue {
-				d, err := time.ParseDuration(delay)
-				if err != nil {
-					panic(err)
-				}
-				p.retryQueue = append(p.retryQueue, int64(d/time.Millisecond))
-			}
-			return
-		}
-		d, err := time.ParseDuration(retry.Delay)
-		if err != nil {
-			panic(err)
-		}
-		p.retryQueue = help.GetRetryQueue(int64(d/time.Millisecond), retry.Max, strategy)
-	}
-}
+//func evaParam(param []Param) *params {
+//	ps := &params{}
+//	for _, p := range param {
+//		p(ps)
+//	}
+//	return ps
+//}
 
-func evaParam(param []Param) *params {
-	ps := &params{}
-	for _, p := range param {
-		p(ps)
-	}
-	return ps
-}
+type LaunchJobOpt = broker.ConsumeOption
 
-func (c *Consumer) LaunchJob(key, queue string, job Job, param ...Param) {
-	ps := evaParam(param)
+func (c *Consumer) LaunchJob(key, queue string, job Job, optChain ...*LaunchJobOpt) {
+	//ps := evaParam(param)
 
 	q := &broker.Queue{
-		Name:       queue,
-		RouteKey:   key,
-		RetryQueue: ps.retryQueue,
+		Name:     queue,
+		RouteKey: key,
+		//RetryQueue: ps.retryQueue,
+		RetryQueue: make([]int64, 0),
 		Handle: func(body []byte) broker.Status {
 			var err error
 
@@ -116,7 +118,7 @@ func (c *Consumer) LaunchJob(key, queue string, job Job, param ...Param) {
 
 	for {
 		log.Printf("job %s start consume...", queue)
-		if err := c.broker.Consume(q); err != nil {
+		if err := c.broker.Consume(q, optChain...); err != nil {
 			log.Printf("job %s consume error: %v ,retrying consume after 30s", queue, err)
 			time.Sleep(30 * time.Second)
 		}
@@ -159,9 +161,9 @@ func (c *Consumer) LaunchTopicJob(group string, topic string, job Job) {
 	}
 }
 
-func (c *Consumer) LaunchDirectJob(key string, job Job, param ...Param) {
-	c.LaunchJob(key, key, job, param...)
-}
+//func (c *Consumer) LaunchDirectJob(key string, job Job, param ...Param) {
+//	c.LaunchJob(key, key, job, param...)
+//}
 
 func (c *Consumer) monitoring(address string) {
 	mux := http.NewServeMux()

@@ -13,6 +13,7 @@ import (
 	"github.com/streadway/amqp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"golang.org/x/time/rate"
 )
 
 type AmqpBrokerOptions struct {
@@ -69,7 +70,31 @@ func (a *AmqpBroker) Health() bool {
 	return a.conn != nil
 }
 
-func (a *AmqpBroker) Consume(queue *Queue) error {
+type ConsumeOption struct {
+	QosPrefetchCount int // 每次消费数量上限, 默认10, interval >0 时强制为1
+	QosPrefetchSize  int // 每次消费大小上限
+
+	Interval time.Duration // 消费间隔
+	Limit    int           // 每个周期消费数量上限, 默认为 1
+}
+
+func (a *AmqpBroker) Consume(queue *Queue, optChain ...*ConsumeOption) error {
+
+	opt := &ConsumeOption{
+		QosPrefetchCount: 10,
+	}
+	ctx := context.Background()
+
+	if len(optChain) > 0 && optChain[0] != nil {
+		opt = optChain[0]
+		if opt.Interval > 0 {
+			opt.QosPrefetchCount = 1
+			if opt.Limit <= 0 {
+				opt.Limit = 1
+			}
+		}
+	}
+
 	if a.conn == nil {
 		return errors.New("conn is nil")
 	}
@@ -91,7 +116,7 @@ func (a *AmqpBroker) Consume(queue *Queue) error {
 	); err != nil {
 		return err
 	}
-	if err := channel.Qos(10, 0, false); err != nil {
+	if err := channel.Qos(opt.QosPrefetchCount, opt.QosPrefetchSize, false); err != nil {
 		return err
 	}
 
@@ -111,11 +136,16 @@ func (a *AmqpBroker) Consume(queue *Queue) error {
 	a.notifies[queue.Name] = notify
 	a.m.Unlock()
 
+	limiter := rate.NewLimiter(rate.Every(opt.Interval), opt.Limit)
+
 	for {
 		select {
 		case err := <-notify:
 			return err
 		case d := <-delivery:
+			if opt.Interval > 0 {
+				_ = limiter.Wait(ctx)
+			}
 			switch status := queue.Handle(d.Body); status {
 			case Retry:
 				if err := a.retry(queue, d); err != nil {

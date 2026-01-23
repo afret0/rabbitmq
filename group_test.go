@@ -3,9 +3,11 @@ package rabbitmq
 import (
 	"testing"
 	"time"
+
+	"github.com/afret0/wheel/tool"
 )
 
-func Test_Rabbitmq(t *testing.T) {
+func Test_Group(t *testing.T) {
 	topic := "test-topic"
 	group := "test-group"
 	groupV1 := "test-group-v1"
@@ -30,9 +32,11 @@ func Test_Rabbitmq(t *testing.T) {
 	consumer := NewConsumer(conOpt)
 	producer := NewProducer(proOpt)
 
+	ctx := tool.NewCtxBK()
+
 	go func() {
 		for now := range time.Tick(3 * time.Second) {
-			err := producer.Publish(topic, map[string]string{"now": now.String()})
+			err := producer.Publish(ctx, topic, map[string]string{"now": now.String()})
 			if err != nil {
 				t.Error(err)
 			}
