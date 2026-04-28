@@ -21,5 +21,6 @@ type Broker interface {
 	ConsumerTopic(opt *GroupConsumeOption, handle func([]byte) Status) error
 	Publish(ctx context.Context, key string, body []byte) error
 	PublishDelay(ctx context.Context, queue string, body []byte, delay int64) error
+	DeclareQueue(name, routingKey string) error
 	Health() bool
 }

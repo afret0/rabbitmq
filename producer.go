@@ -25,6 +25,13 @@ func NewProducer(opt *ProducerOptions) *Producer {
 	return &Producer{broker: broker}
 }
 
+// DeclareQueue 在 publisher 端预先声明队列并绑定到 exchange。
+// 推荐在服务启动时对所有要发送的 routing key / queue 调用一次，
+// 这样即便 consumer 还没起，broker 也不会因为 unroutable 把消息丢掉。
+func (p *Producer) DeclareQueue(name, routingKey string) error {
+	return p.broker.DeclareQueue(name, routingKey)
+}
+
 func (p *Producer) Publish(ctx context.Context, key string, data interface{}) error {
 	var body []byte
 	switch d := data.(type) {

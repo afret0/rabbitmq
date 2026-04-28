@@ -1,6 +1,7 @@
 package rabbitmq
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -32,7 +33,7 @@ func Test_Rabbitmq(t *testing.T) {
 
 	go func() {
 		for now := range time.Tick(3 * time.Second) {
-			err := producer.Publish(topic, map[string]string{"now": now.String()})
+			err := producer.Publish(context.Background(), topic, map[string]string{"now": now.String()})
 			if err != nil {
 				t.Error(err)
 			}

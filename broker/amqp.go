@@ -15,6 +15,10 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 )
 
+// publishConfirmTimeout 是等待 broker publisher confirm 的超时时间。
+// 超时会被当作发送失败返回，避免在 broker 侧静默丢消息。
+const publishConfirmTimeout = 5 * time.Second
+
 type AmqpBrokerOptions struct {
 	Url          string
 	Exchange     string
@@ -26,6 +30,16 @@ type AmqpBroker struct {
 	conn     *amqp.Connection
 	notifies map[string]chan *amqp.Error
 	options  *AmqpBrokerOptions
+
+	// publish 路径独立状态，开启 publisher confirm 后保证消息真正落地
+	pubMu     sync.Mutex
+	pubCh     *amqp.Channel
+	pubAck    chan amqp.Confirmation
+	pubReturn chan amqp.Return
+	pubClosed chan *amqp.Error
+	// pubSeq 跟踪当前 channel 上下一条 publish 的 DeliveryTag（从 1 开始），
+	// 用来与 confirm 一一配对，发现错位立刻报错。channel 重建时归零。
+	pubSeq uint64
 }
 
 func NewAmqpBroker(option *AmqpBrokerOptions) *AmqpBroker {
@@ -46,34 +60,57 @@ func NewAmqpBroker(option *AmqpBrokerOptions) *AmqpBroker {
 }
 
 func (a *AmqpBroker) keepAlive() {
-	if a.conn != nil {
-		cc := a.conn.NotifyClose(make(chan *amqp.Error))
+	a.m.Lock()
+	conn := a.conn
+	a.m.Unlock()
+
+	if conn != nil {
+		cc := conn.NotifyClose(make(chan *amqp.Error))
 		log.Printf("amqp conn close: %v", <-cc)
 	}
 
-	var err error
-	if a.conn, err = amqp.Dial(a.options.Url); err != nil {
+	newConn, err := amqp.Dial(a.options.Url)
+	if err != nil {
 		log.Printf("amqp redial faild: %v", err)
 		time.AfterFunc(5*time.Second, a.keepAlive)
 		return
 	}
 	log.Println("amqp redial success...")
 
+	a.m.Lock()
+	a.conn = newConn
+	notifies := make([]chan *amqp.Error, 0, len(a.notifies))
 	for _, n := range a.notifies {
-		n <- amqp.ErrClosed
+		notifies = append(notifies, n)
+	}
+	a.m.Unlock()
+
+	// 重连后强制重建 publish channel
+	a.resetPubChannel()
+
+	for _, n := range notifies {
+		select {
+		case n <- amqp.ErrClosed:
+		default:
+		}
 	}
 	a.keepAlive()
 }
 
 func (a *AmqpBroker) Health() bool {
-	return a.conn != nil
+	a.m.Lock()
+	defer a.m.Unlock()
+	return a.conn != nil && !a.conn.IsClosed()
 }
 
 func (a *AmqpBroker) Consume(queue *Queue) error {
-	if a.conn == nil {
+	a.m.Lock()
+	conn := a.conn
+	a.m.Unlock()
+	if conn == nil {
 		return errors.New("conn is nil")
 	}
-	channel, err := a.conn.Channel()
+	channel, err := conn.Channel()
 	if err != nil {
 		return err
 	}
@@ -104,7 +141,7 @@ func (a *AmqpBroker) Consume(queue *Queue) error {
 		return err
 	}
 
-	notify := make(chan *amqp.Error)
+	notify := make(chan *amqp.Error, 1)
 	defer close(notify)
 
 	a.m.Lock()
@@ -137,14 +174,17 @@ type GroupConsumeOption struct {
 }
 
 func (a *AmqpBroker) ConsumerTopic(opt *GroupConsumeOption, handle func([]byte) Status) error {
-	if a.conn == nil {
+	a.m.Lock()
+	conn := a.conn
+	a.m.Unlock()
+	if conn == nil {
 		return fmt.Errorf("conn is nil")
 	}
 	if opt.Group == "" || len(opt.RoutingKeys) == 0 {
 		return fmt.Errorf("group or routing keys empty")
 	}
 
-	ch, err := a.conn.Channel()
+	ch, err := conn.Channel()
 	if err != nil {
 		return err
 	}
@@ -202,7 +242,13 @@ func (a *AmqpBroker) ConsumerTopic(opt *GroupConsumeOption, handle func([]byte) 
 }
 
 func (a *AmqpBroker) retry(queue *Queue, d amqp.Delivery) error {
-	channel, err := a.conn.Channel()
+	a.m.Lock()
+	conn := a.conn
+	a.m.Unlock()
+	if conn == nil {
+		return errors.New("conn is nil")
+	}
+	channel, err := conn.Channel()
 	if err != nil {
 		return err
 	}
@@ -236,21 +282,106 @@ func (a *AmqpBroker) retry(queue *Queue, d amqp.Delivery) error {
 	})
 }
 
-func (a *AmqpBroker) Publish(ctx context.Context, key string, body []byte) error {
-	channel, err := a.conn.Channel()
-	if err != nil {
-		return err
+// ensurePubChannelLocked 必须在持有 a.pubMu 的情况下调用。
+// 它返回一个开启了 publisher confirm 的长生命周期 channel，以及该 channel 上的 ack / return 通知 channel。
+func (a *AmqpBroker) ensurePubChannelLocked() (*amqp.Channel, chan amqp.Confirmation, chan amqp.Return, error) {
+	if a.pubCh != nil {
+		select {
+		case err, ok := <-a.pubClosed:
+			if ok && err != nil {
+				log.Printf("amqp publish channel closed: %v, will recreate", err)
+			}
+			a.pubCh = nil
+			a.pubAck = nil
+			a.pubReturn = nil
+			a.pubClosed = nil
+		default:
+			return a.pubCh, a.pubAck, a.pubReturn, nil
+		}
 	}
-	defer channel.Close()
 
-	if err := channel.ExchangeDeclare(
+	a.m.Lock()
+	conn := a.conn
+	a.m.Unlock()
+	if conn == nil || conn.IsClosed() {
+		return nil, nil, nil, errors.New("amqp connection is not ready")
+	}
+
+	ch, err := conn.Channel()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	if err := ch.ExchangeDeclare(
 		a.options.Exchange,
 		a.options.ExchangeType,
 		true, false, false, false, nil,
 	); err != nil {
-		return err
+		_ = ch.Close()
+		return nil, nil, nil, err
 	}
 
+	if err := ch.Confirm(false); err != nil {
+		_ = ch.Close()
+		return nil, nil, nil, err
+	}
+
+	a.pubCh = ch
+	a.pubAck = ch.NotifyPublish(make(chan amqp.Confirmation, 256))
+	a.pubReturn = ch.NotifyReturn(make(chan amqp.Return, 16))
+	a.pubClosed = ch.NotifyClose(make(chan *amqp.Error, 1))
+	a.pubSeq = 0
+	return a.pubCh, a.pubAck, a.pubReturn, nil
+}
+
+func (a *AmqpBroker) resetPubChannelLocked() {
+	if a.pubCh != nil {
+		_ = a.pubCh.Close()
+	}
+	a.pubCh = nil
+	a.pubAck = nil
+	a.pubReturn = nil
+	a.pubClosed = nil
+	a.pubSeq = 0
+}
+
+func (a *AmqpBroker) resetPubChannel() {
+	a.pubMu.Lock()
+	defer a.pubMu.Unlock()
+	a.resetPubChannelLocked()
+}
+
+// DeclareQueue 在 publisher 启动 / 首次发送时声明队列并绑定到 exchange，
+// 避免 consumer 尚未启动时出现 unroutable 静默丢消息。幂等。
+func (a *AmqpBroker) DeclareQueue(name, routingKey string) error {
+	a.m.Lock()
+	conn := a.conn
+	a.m.Unlock()
+	if conn == nil || conn.IsClosed() {
+		return errors.New("amqp connection is not ready")
+	}
+	ch, err := conn.Channel()
+	if err != nil {
+		return err
+	}
+	defer ch.Close()
+
+	if err := ch.ExchangeDeclare(
+		a.options.Exchange, a.options.ExchangeType,
+		true, false, false, false, nil,
+	); err != nil {
+		return err
+	}
+	if _, err := ch.QueueDeclare(name, true, false, false, false, nil); err != nil {
+		return err
+	}
+	if routingKey == "" {
+		routingKey = name
+	}
+	return ch.QueueBind(name, routingKey, a.options.Exchange, false, nil)
+}
+
+func (a *AmqpBroker) Publish(ctx context.Context, key string, body []byte) error {
 	opId := tool.OpId(ctx)
 	hds := amqp.Table{"opId": opId}
 	if tool.EnvEnabled("TRACE") {
@@ -265,16 +396,91 @@ func (a *AmqpBroker) Publish(ctx context.Context, key string, body []byte) error
 		)
 	}
 
-	return channel.Publish(a.options.Exchange, key, false, false, amqp.Publishing{
+	a.pubMu.Lock()
+	defer a.pubMu.Unlock()
+
+	ch, confirms, returns, err := a.ensurePubChannelLocked()
+	if err != nil {
+		return err
+	}
+
+	// 记录本次 publish 对应的 DeliveryTag（broker 从 1 开始递增），
+	// 便于和后续 confirm 配对，发现错位立刻报错暴露问题。
+	a.pubSeq++
+	expectedTag := a.pubSeq
+
+	// mandatory=true: 路由不到队列时 broker 通过 basic.return 退回，
+	// 否则即便开启了 publisher confirm，broker 仍会返回 Ack=true 但消息已被丢弃。
+	if err := ch.Publish(a.options.Exchange, key, true, false, amqp.Publishing{
 		Headers:      hds,
 		ContentType:  "",
 		Body:         body,
 		DeliveryMode: amqp.Persistent,
-	})
+	}); err != nil {
+		a.resetPubChannelLocked()
+		return err
+	}
+
+	// 等待 broker 真正确认收到，避免 channel 关闭/网络层缓冲导致的静默丢失。
+	// 注意：confirms / returns 是按 publish 顺序与 channel 共享的串行队列，
+	// 任何提前返回都必须 reset channel，避免把残留的 confirm 错位给下一次调用。
+	select {
+	case c, ok := <-confirms:
+		if !ok {
+			a.resetPubChannelLocked()
+			return errors.New("amqp publish confirm channel closed")
+		}
+		if c.DeliveryTag != expectedTag {
+			a.resetPubChannelLocked()
+			return fmt.Errorf("amqp publish confirm out of order, want=%d got=%d", expectedTag, c.DeliveryTag)
+		}
+		if !c.Ack {
+			return fmt.Errorf("amqp message nacked, deliveryTag=%d", c.DeliveryTag)
+		}
+		// streadway/amqp 保证 basic.return 在 ack 之前到达，
+		// 这里非阻塞探测 returns，能精确识别 unroutable。
+		select {
+		case r := <-returns:
+			return fmt.Errorf("amqp message unroutable, replyCode=%d replyText=%s exchange=%s routingKey=%s",
+				r.ReplyCode, r.ReplyText, r.Exchange, r.RoutingKey)
+		default:
+			return nil
+		}
+	case r := <-returns:
+		// return 帧到达后 ack 紧随其后，但仍要带超时兜底防止阻塞。
+		select {
+		case <-confirms:
+		case <-time.After(publishConfirmTimeout):
+			a.resetPubChannelLocked()
+		}
+		return fmt.Errorf("amqp message unroutable, replyCode=%d replyText=%s exchange=%s routingKey=%s",
+			r.ReplyCode, r.ReplyText, r.Exchange, r.RoutingKey)
+	case err := <-a.pubClosed:
+		a.resetPubChannelLocked()
+		if err != nil {
+			return err
+		}
+		return errors.New("amqp publish channel closed before confirm")
+	case <-time.After(publishConfirmTimeout):
+		a.resetPubChannelLocked()
+		return errors.New("amqp publish confirm timeout")
+	case <-ctx.Done():
+		// 必须 reset：否则未消费的 confirm 会留在 channel 上，
+		// 与下一次 Publish 错位，导致后续消息被静默"误判为成功"而真正丢失。
+		a.resetPubChannelLocked()
+		return ctx.Err()
+	}
 }
 
 func (a *AmqpBroker) PublishDelay(ctx context.Context, queue string, body []byte, delay int64) error {
-	channel, err := a.conn.Channel()
+	a.m.Lock()
+	conn := a.conn
+	a.m.Unlock()
+	if conn == nil {
+		return errors.New("conn is nil")
+	}
+
+	channel, err := conn.Channel()
 	if err != nil {
 		return err
 	}
@@ -309,9 +515,37 @@ func (a *AmqpBroker) PublishDelay(ctx context.Context, queue string, body []byte
 		return err
 	}
 
-	return channel.Publish("", delayQ, false, false, amqp.Publishing{
-		Headers:      amqp.Table{},
+	if err := channel.Confirm(false); err != nil {
+		return err
+	}
+	confirms := channel.NotifyPublish(make(chan amqp.Confirmation, 1))
+	closed := channel.NotifyClose(make(chan *amqp.Error, 1))
+
+	if err := channel.Publish("", delayQ, false, false, amqp.Publishing{
+		Headers:      amqp.Table{"opId": opId},
 		Body:         body,
 		DeliveryMode: amqp.Persistent,
-	})
+	}); err != nil {
+		return err
+	}
+
+	select {
+	case c, ok := <-confirms:
+		if !ok {
+			return errors.New("amqp publish confirm channel closed")
+		}
+		if !c.Ack {
+			return fmt.Errorf("amqp delay message nacked, deliveryTag=%d", c.DeliveryTag)
+		}
+		return nil
+	case err := <-closed:
+		if err != nil {
+			return err
+		}
+		return errors.New("amqp publish channel closed before confirm")
+	case <-time.After(publishConfirmTimeout):
+		return errors.New("amqp publish confirm timeout")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
