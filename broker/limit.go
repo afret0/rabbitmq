@@ -26,6 +26,32 @@ type ConsumeOption struct {
 
 	Interval time.Duration // 限流窗口
 	Limit    int           // 每个窗口最多消费的条数, <=0 时取 1
+
+	// Retry 是重试退避序列: handler 返回 RetryError 时,
+	// 第 n 次重试会等待 Retry[n] 之后重投, 用尽后不再重试。
+	// 为空表示不做延迟重试, 此时 RetryError 会让消息立即重新入队。
+	Retry []time.Duration
+}
+
+// WithRetry 设置重试退避序列，返回自身以便链式调用：
+//
+//	PerSecond(5).WithRetry(time.Second, 5*time.Second, 30*time.Second)
+func (o *ConsumeOption) WithRetry(delays ...time.Duration) *ConsumeOption {
+	o.Retry = delays
+	return o
+}
+
+// RetryQueueMillis 把 Retry 换算成 Queue.RetryQueue 需要的毫秒序列。
+// 非正数的退避时长会被忽略, 避免生成 ttl 为 0 的延迟队列。
+func (o ConsumeOption) RetryQueueMillis() []int64 {
+	out := make([]int64, 0, len(o.Retry))
+	for _, d := range o.Retry {
+		if d <= 0 {
+			continue
+		}
+		out = append(out, int64(d/time.Millisecond))
+	}
+	return out
 }
 
 // Every 构造「每 d 最多 n 条」的消费配置。

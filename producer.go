@@ -47,7 +47,10 @@ func (p *Producer) Publish(ctx context.Context, key string, data interface{}) er
 	return p.broker.Publish(ctx, key, body)
 }
 
-func (p *Producer) PublishDelay(ctx context.Context, key string, data interface{}, delay int64) error {
+// PublishDelay 延迟投递消息，delaySeconds 单位为**秒**。
+//
+//	producer.PublishDelay(ctx, "order.created", data, 5) // 5 秒后投递
+func (p *Producer) PublishDelay(ctx context.Context, key string, data interface{}, delaySeconds int64) error {
 	var body []byte
 	switch d := data.(type) {
 	case string:
@@ -59,5 +62,5 @@ func (p *Producer) PublishDelay(ctx context.Context, key string, data interface{
 		}
 		body = b
 	}
-	return p.broker.PublishDelay(ctx, key, body, delay)
+	return p.broker.PublishDelay(ctx, key, body, delaySeconds)
 }

@@ -148,14 +148,24 @@ func LimitPerSecond(n int) *LaunchJobOpt {
 	return broker.PerSecond(n)
 }
 
+// RetryAfter 配置重试退避序列：handler 返回 RetryError 时，
+// 第 n 次重试等待 delays[n]，用尽后不再重试。
+//
+//	consumer.LaunchJob(key, queue, job, RetryAfter(time.Second, 5*time.Second))
+func RetryAfter(delays ...time.Duration) *LaunchJobOpt {
+	return (&LaunchJobOpt{}).WithRetry(delays...)
+}
+
 func (c *Consumer) LaunchJob(key, queue string, job Job, optChain ...*LaunchJobOpt) {
-	//ps := evaParam(param)
+	retryQueue := make([]int64, 0)
+	if len(optChain) > 0 && optChain[0] != nil {
+		retryQueue = optChain[0].RetryQueueMillis()
+	}
 
 	q := &broker.Queue{
-		Name:     queue,
-		RouteKey: key,
-		//RetryQueue: ps.retryQueue,
-		RetryQueue: make([]int64, 0),
+		Name:       queue,
+		RouteKey:   key,
+		RetryQueue: retryQueue,
 		Handle: func(body []byte) broker.Status {
 			var err error
 

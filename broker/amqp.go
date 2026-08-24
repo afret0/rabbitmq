@@ -200,10 +200,24 @@ func (a *AmqpBroker) Consume(queue *Queue, optChain ...*ConsumeOption) error {
 	return consumeLoop(ctx, delivery, notify, newLimiter(opt), func(d amqp.Delivery) {
 		switch status := queue.Handle(d.Body); status {
 		case Retry:
-			if err := a.retry(queue, d); err != nil {
-				d.Nack(false, true)
-			} else {
+			scheduled, err := a.retry(queue, d)
+			if err != nil {
+				log.Printf("queue %s schedule retry failed: %v, requeue", queue.Name, err)
+			}
+
+			switch retryAction(scheduled, err, len(queue.RetryQueue) > 0) {
+			case actionAck:
 				d.Ack(false)
+			case actionReject:
+				log.Printf("queue %s retry exhausted after %d attempts, rejecting message",
+					queue.Name, len(queue.RetryQueue))
+				d.Nack(false, false)
+			default:
+				if err == nil && len(queue.RetryQueue) == 0 {
+					log.Printf("queue %s asked to retry but no retry backoff configured, "+
+						"requeueing immediately; consider RetryAfter(...)", queue.Name)
+				}
+				d.Nack(false, true)
 			}
 		default:
 			d.Ack(false)
@@ -285,24 +299,29 @@ func (a *AmqpBroker) ConsumerTopic(opt *GroupConsumeOption, handle func([]byte) 
 	return nil
 }
 
-func (a *AmqpBroker) retry(queue *Queue, d amqp.Delivery) error {
+// retry 把消息投递到延迟队列以便稍后重投。
+//
+// 返回 scheduled 表示是否真的调度了一次重试：
+// 未配置 RetryQueue 或重试次数已用尽时返回 (false, nil)，
+// 调用方必须据此决定回执，不能当作成功而 Ack，否则消息会被静默丢弃。
+func (a *AmqpBroker) retry(queue *Queue, d amqp.Delivery) (scheduled bool, err error) {
+	retryCount, _ := d.Headers["x-retry-count"].(int32)
+
+	if int(retryCount) >= len(queue.RetryQueue) {
+		return false, nil
+	}
+
 	a.m.Lock()
 	conn := a.conn
 	a.m.Unlock()
 	if conn == nil {
-		return errors.New("conn is nil")
+		return false, errors.New("conn is nil")
 	}
 	channel, err := conn.Channel()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer channel.Close()
-
-	retryCount, _ := d.Headers["x-retry-count"].(int32)
-
-	if int(retryCount) >= len(queue.RetryQueue) {
-		return nil
-	}
 
 	delay := queue.RetryQueue[retryCount]
 	delayDuration := time.Duration(delay) * time.Millisecond
@@ -316,14 +335,18 @@ func (a *AmqpBroker) retry(queue *Queue, d amqp.Delivery) error {
 			"x-expires":                 delay * 2,
 		},
 	); err != nil {
-		return err
+		return false, err
 	}
 
-	return channel.Publish("", delayQ, false, false, amqp.Publishing{
+	if err := channel.Publish("", delayQ, false, false, amqp.Publishing{
 		Headers:      amqp.Table{"x-retry-count": retryCount + 1},
 		Body:         d.Body,
 		DeliveryMode: amqp.Persistent,
-	})
+	}); err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 // ensurePubChannelLocked 必须在持有 a.pubMu 的情况下调用。
@@ -516,7 +539,9 @@ func (a *AmqpBroker) Publish(ctx context.Context, key string, body []byte) error
 	}
 }
 
-func (a *AmqpBroker) PublishDelay(ctx context.Context, queue string, body []byte, delay int64) error {
+// PublishDelay 延迟投递, delaySeconds 单位为秒。
+// 内部换算为 AMQP 的 x-message-ttl(毫秒), 注意与 Queue.RetryQueue 的毫秒不同。
+func (a *AmqpBroker) PublishDelay(ctx context.Context, queue string, body []byte, delaySeconds int64) error {
 	a.m.Lock()
 	conn := a.conn
 	a.m.Unlock()
@@ -530,15 +555,15 @@ func (a *AmqpBroker) PublishDelay(ctx context.Context, queue string, body []byte
 	}
 	defer channel.Close()
 
-	delayQ := fmt.Sprintf("delay.%d.%s.%s", delay, a.options.Exchange, queue)
+	delayQ := fmt.Sprintf("delay.%d.%s.%s", delaySeconds, a.options.Exchange, queue)
 
 	opId := tool.OpId(ctx)
 	hd := amqp.Table{
 		"opId":                      opId,
 		"x-dead-letter-exchange":    a.options.Exchange,
 		"x-dead-letter-routing-key": queue,
-		"x-message-ttl":             delay * 1000,
-		"x-expires":                 delay * 2 * 1000,
+		"x-message-ttl":             delaySeconds * 1000,
+		"x-expires":                 delaySeconds * 2 * 1000,
 	}
 
 	if tool.EnvEnabled("TRACE") {

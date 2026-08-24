@@ -84,6 +84,25 @@ consumer.LaunchJob("order.created", "order-queue", job, &rabbitmq.LaunchJobOpt{P
 - 限流作用于「取到消息之后、执行 handler 之前」，因此实际吞吐是 `min(限流速率, 1/handler 耗时)`。handler 本身慢于限流速率时，限流不会额外生效。
 - 限流目前只对 `LaunchJob` 生效，`LaunchTopicJob` 暂不支持。
 
+## 重试
+
+handler 返回 `rabbitmq.RetryError` 表示这条消息需要重试。用 `RetryAfter` 配置退避序列：
+
+```go
+// 第 1 次重试等 1 秒，第 2 次等 5 秒，第 3 次等 30 秒，之后不再重试
+consumer.LaunchJob(key, queue, job, rabbitmq.RetryAfter(time.Second, 5*time.Second, 30*time.Second))
+
+// 也可以和限流一起用
+consumer.LaunchJob(key, queue, job,
+	rabbitmq.LimitPerSecond(5).WithRetry(time.Second, 5*time.Second))
+```
+
+行为：
+
+- 每次重试会把消息投递到一个带 TTL 的延迟队列，到期后经死信路由回原队列，重试次数记在 `x-retry-count` 头上。
+- **没有配置退避序列时**，`RetryError` 会让消息立即重新入队（`Nack` + requeue）。这能保证消息不丢，但如果 handler 一直失败就会持续重投，所以需要重试时请显式配置 `RetryAfter`。
+- **重试次数用尽时**，消息被 `Nack`（不重新入队），有死信配置则进死信，否则丢弃，同时打印日志。
+
 ## 广播 / 消费组
 
 同一个 `group` 内的实例共享队列（竞争消费），不同 `group` 各收一份（广播）。
