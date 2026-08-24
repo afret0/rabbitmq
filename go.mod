@@ -5,8 +5,10 @@ go 1.22.4
 require (
 	github.com/afret0/wheel v1.1.70-ctx-1
 	github.com/prometheus/client_golang v1.20.4
+	github.com/sirupsen/logrus v1.9.3
 	github.com/streadway/amqp v1.1.0
 	go.opentelemetry.io/otel v1.24.0
+	golang.org/x/sync v0.7.0
 	golang.org/x/time v0.5.0
 )
 
@@ -45,7 +47,6 @@ require (
 	github.com/prometheus/procfs v0.15.1 // indirect
 	github.com/sagikazarmark/locafero v0.4.0 // indirect
 	github.com/sagikazarmark/slog-shim v0.1.0 // indirect
-	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/sourcegraph/conc v0.3.0 // indirect
 	github.com/spf13/afero v1.11.0 // indirect
 	github.com/spf13/cast v1.6.0 // indirect

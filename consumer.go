@@ -1,16 +1,19 @@
 package rabbitmq
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"time"
 
-	"github.com/afret0/rabbitmq/broker"
 	"github.com/afret0/wheel/tool"
-
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/sirupsen/logrus"
+
+	"github.com/afret0/rabbitmq/broker"
+	log2 "github.com/afret0/wheel/log"
 )
 
 var RetryError = errors.New("job retry")
@@ -52,6 +55,48 @@ func NewConsumer(opt *ConsumerOptions) *Consumer {
 }
 
 type Job func([]byte) error
+
+type Message[T any] struct {
+	//OpId string `json:"opId" required:"true"`
+	MsgId string `json:"msgId" required:"true"`
+	Data  T      `json:"data"`
+}
+
+func NewJob[T any](f func(ctx context.Context, p T) error) Job {
+	return func(msgS []byte) error {
+		c1, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		lg1 := log2.CtxLogger(c1).WithFields(logrus.Fields{})
+		if tool.Debug() {
+			lg1.Printf("receive msg: %s", string(msgS))
+		}
+
+		M := &Message[T]{}
+		err := tool.Unmarshal(string(msgS), M)
+		if err != nil {
+			lg1.Printf("unmarshal message error: %s, msg: %s", err, string(msgS))
+			return err
+		}
+
+		ctx := context.WithValue(c1, "opId", M.MsgId)
+		lg := log2.CtxLogger(ctx).WithFields(logrus.Fields{})
+		if tool.Debug() {
+			lg.Infof("start process message: %s", string(msgS))
+		}
+
+		err = f(ctx, M.Data)
+		if err != nil {
+			lg.Errorf("process message error: %s", err)
+			return err
+		}
+
+		if tool.Debug() {
+			lg.Infof("process message success: %s", string(msgS))
+		}
+
+		return nil
+	}
+}
 
 //type params struct {
 //	retryQueue []int64
