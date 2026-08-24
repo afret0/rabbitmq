@@ -17,7 +17,7 @@ type Queue struct {
 }
 
 type Broker interface {
-	Consume(queue *Queue) error
+	Consume(queue *Queue, optChain ...*ConsumeOption) error
 	ConsumerTopic(opt *GroupConsumeOption, handle func([]byte) Status) error
 	Publish(ctx context.Context, key string, body []byte) error
 	PublishDelay(ctx context.Context, queue string, body []byte, delay int64) error
