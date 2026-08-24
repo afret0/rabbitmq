@@ -105,29 +105,47 @@ func (a *AmqpBroker) Health() bool {
 }
 
 type ConsumeOption struct {
-	QosPrefetchCount int // 每次消费数量上限, 默认10, interval >0 时强制为1
+	QosPrefetchCount int // 每次消费数量上限, 默认10, interval >0 时取 Limit
 	QosPrefetchSize  int // 每次消费大小上限
 
 	Interval time.Duration // 消费间隔
-	Limit    int           // 每个周期消费数量上限, 默认为 1
+	Limit    int           // 每个 Interval 周期内消费数量上限, 默认为 1
+}
+
+const defaultQosPrefetchCount = 10
+
+// normalize 返回补齐默认值后的副本，不会修改调用方传入的配置。
+func normalize(optChain ...*ConsumeOption) ConsumeOption {
+	opt := ConsumeOption{}
+	if len(optChain) > 0 && optChain[0] != nil {
+		opt = *optChain[0]
+	}
+
+	if opt.Interval > 0 {
+		if opt.Limit <= 0 {
+			opt.Limit = 1
+		}
+		// 限流时未 Ack 消息数与周期配额对齐，避免预取过多打乱消费节奏
+		opt.QosPrefetchCount = opt.Limit
+	} else if opt.QosPrefetchCount <= 0 {
+		opt.QosPrefetchCount = defaultQosPrefetchCount
+	}
+
+	return opt
+}
+
+// newLimiter 按「每 Interval 周期内最多 Limit 条」构造限流器，未开启限流时返回 nil。
+func newLimiter(opt ConsumeOption) *rate.Limiter {
+	if opt.Interval <= 0 {
+		return nil
+	}
+	return rate.NewLimiter(rate.Limit(float64(opt.Limit)/opt.Interval.Seconds()), opt.Limit)
 }
 
 func (a *AmqpBroker) Consume(queue *Queue, optChain ...*ConsumeOption) error {
 
-	opt := &ConsumeOption{
-		QosPrefetchCount: 10,
-	}
+	opt := normalize(optChain...)
 	ctx := context.Background()
-
-	if len(optChain) > 0 && optChain[0] != nil {
-		opt = optChain[0]
-		if opt.Interval > 0 {
-			opt.QosPrefetchCount = 1
-			if opt.Limit <= 0 {
-				opt.Limit = 1
-			}
-		}
-	}
 
 	a.m.Lock()
 	conn := a.conn
@@ -173,14 +191,14 @@ func (a *AmqpBroker) Consume(queue *Queue, optChain ...*ConsumeOption) error {
 	a.notifies[queue.Name] = notify
 	a.m.Unlock()
 
-	limiter := rate.NewLimiter(rate.Every(opt.Interval), opt.Limit)
+	limiter := newLimiter(opt)
 
 	for {
 		select {
 		case err := <-notify:
 			return err
 		case d := <-delivery:
-			if opt.Interval > 0 {
+			if limiter != nil {
 				_ = limiter.Wait(ctx)
 			}
 			switch status := queue.Handle(d.Body); status {
