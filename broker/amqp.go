@@ -104,15 +104,31 @@ func (a *AmqpBroker) Health() bool {
 	return a.conn != nil && !a.conn.IsClosed()
 }
 
-type ConsumeOption struct {
-	QosPrefetchCount int // 每次消费数量上限, 默认10, interval >0 时取 Limit
-	QosPrefetchSize  int // 每次消费大小上限
+// defaultPrefetch 是未显式配置时的未 Ack 消息上限。
+const defaultPrefetch = 10
 
-	Interval time.Duration // 消费间隔
-	Limit    int           // 每个 Interval 周期内消费数量上限, 默认为 1
+// ConsumeOption 消费配置。
+//
+// 限流语义只有一条：每 Interval 最多消费 Limit 条。
+// Interval <= 0 表示不限流；此时只有 Prefetch 生效。
+type ConsumeOption struct {
+	// Prefetch 未 Ack 消息上限, <=0 时取 10。
+	// 开启限流时会自动对齐为 Limit, 无需手动设置。
+	Prefetch int
+
+	Interval time.Duration // 限流窗口
+	Limit    int           // 每个窗口最多消费的条数, <=0 时取 1
 }
 
-const defaultQosPrefetchCount = 10
+// Every 构造「每 d 最多 n 条」的消费配置。
+func Every(d time.Duration, n int) *ConsumeOption {
+	return &ConsumeOption{Interval: d, Limit: n}
+}
+
+// PerSecond 构造「每秒最多 n 条」的消费配置。
+func PerSecond(n int) *ConsumeOption {
+	return Every(time.Second, n)
+}
 
 // normalize 返回补齐默认值后的副本，不会修改调用方传入的配置。
 func normalize(optChain ...*ConsumeOption) ConsumeOption {
@@ -125,21 +141,58 @@ func normalize(optChain ...*ConsumeOption) ConsumeOption {
 		if opt.Limit <= 0 {
 			opt.Limit = 1
 		}
-		// 限流时未 Ack 消息数与周期配额对齐，避免预取过多打乱消费节奏
-		opt.QosPrefetchCount = opt.Limit
-	} else if opt.QosPrefetchCount <= 0 {
-		opt.QosPrefetchCount = defaultQosPrefetchCount
+		// 限流时未 Ack 消息数与窗口配额对齐，避免预取过多打乱消费节奏
+		opt.Prefetch = opt.Limit
+	} else if opt.Prefetch <= 0 {
+		opt.Prefetch = defaultPrefetch
 	}
 
 	return opt
 }
 
-// newLimiter 按「每 Interval 周期内最多 Limit 条」构造限流器，未开启限流时返回 nil。
+// newLimiter 按「每 Interval 最多 Limit 条」构造限流器，未开启限流时返回 nil。
 func newLimiter(opt ConsumeOption) *rate.Limiter {
 	if opt.Interval <= 0 {
 		return nil
 	}
 	return rate.NewLimiter(rate.Limit(float64(opt.Limit)/opt.Interval.Seconds()), opt.Limit)
+}
+
+// errDeliveryClosed 表示 broker 关闭了投递通道, 需要由上层重新发起消费。
+var errDeliveryClosed = errors.New("delivery channel closed")
+
+// consumeLoop 按限流节奏消费 delivery。
+//
+// 返回值恒为非 nil：delivery 被关闭或收到连接关闭通知都需要上层重连，
+// 返回 nil 会让调用方的重连循环误判为正常结束而空转。
+func consumeLoop(
+	ctx context.Context,
+	delivery <-chan amqp.Delivery,
+	notify <-chan *amqp.Error,
+	limiter *rate.Limiter,
+	handle func(amqp.Delivery),
+) error {
+	for {
+		select {
+		case err := <-notify:
+			if err != nil {
+				return err
+			}
+			return amqp.ErrClosed
+		case d, ok := <-delivery:
+			// 通道关闭后接收会立即返回零值, 必须退出,
+			// 否则会空转并对零值消息反复调用 handle。
+			if !ok {
+				return errDeliveryClosed
+			}
+			if limiter != nil {
+				if err := limiter.Wait(ctx); err != nil {
+					return err
+				}
+			}
+			handle(d)
+		}
+	}
 }
 
 func (a *AmqpBroker) Consume(queue *Queue, optChain ...*ConsumeOption) error {
@@ -171,7 +224,7 @@ func (a *AmqpBroker) Consume(queue *Queue, optChain ...*ConsumeOption) error {
 	); err != nil {
 		return err
 	}
-	if err := channel.Qos(opt.QosPrefetchCount, opt.QosPrefetchSize, false); err != nil {
+	if err := channel.Qos(opt.Prefetch, 0, false); err != nil {
 		return err
 	}
 
@@ -185,34 +238,31 @@ func (a *AmqpBroker) Consume(queue *Queue, optChain ...*ConsumeOption) error {
 	}
 
 	notify := make(chan *amqp.Error, 1)
-	defer close(notify)
 
 	a.m.Lock()
 	a.notifies[queue.Name] = notify
 	a.m.Unlock()
 
-	limiter := newLimiter(opt)
+	// 只摘除注册、不 close：keepAlive 可能仍持有该 channel 的引用，
+	// close 后再写入会 panic。
+	defer func() {
+		a.m.Lock()
+		delete(a.notifies, queue.Name)
+		a.m.Unlock()
+	}()
 
-	for {
-		select {
-		case err := <-notify:
-			return err
-		case d := <-delivery:
-			if limiter != nil {
-				_ = limiter.Wait(ctx)
-			}
-			switch status := queue.Handle(d.Body); status {
-			case Retry:
-				if err := a.retry(queue, d); err != nil {
-					d.Nack(false, true)
-				} else {
-					d.Ack(false)
-				}
-			default:
+	return consumeLoop(ctx, delivery, notify, newLimiter(opt), func(d amqp.Delivery) {
+		switch status := queue.Handle(d.Body); status {
+		case Retry:
+			if err := a.retry(queue, d); err != nil {
+				d.Nack(false, true)
+			} else {
 				d.Ack(false)
 			}
+		default:
+			d.Ack(false)
 		}
-	}
+	})
 }
 
 type GroupConsumeOption struct {

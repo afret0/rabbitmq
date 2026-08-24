@@ -134,6 +134,20 @@ func NewJob[T any](f func(ctx context.Context, p T) error) Job {
 
 type LaunchJobOpt = broker.ConsumeOption
 
+// LimitEvery 限制消费速率为「每 d 最多 n 条」。
+//
+//	consumer.LaunchJob(key, queue, job, LimitEvery(time.Second, 5))
+func LimitEvery(d time.Duration, n int) *LaunchJobOpt {
+	return broker.Every(d, n)
+}
+
+// LimitPerSecond 限制消费速率为「每秒最多 n 条」。
+//
+//	consumer.LaunchJob(key, queue, job, LimitPerSecond(5))
+func LimitPerSecond(n int) *LaunchJobOpt {
+	return broker.PerSecond(n)
+}
+
 func (c *Consumer) LaunchJob(key, queue string, job Job, optChain ...*LaunchJobOpt) {
 	//ps := evaParam(param)
 

@@ -45,6 +45,6 @@ func Test_Limit(t *testing.T) {
 		remain--
 		t.Logf("remain: %d", remain)
 		return nil
-	}, &LaunchJobOpt{Interval: 2 * time.Second, Limit: 1})
+	}, LimitEvery(2*time.Second, 1))
 
 }
