@@ -8,6 +8,7 @@ require (
 	github.com/sirupsen/logrus v1.9.3
 	github.com/streadway/amqp v1.1.0
 	go.opentelemetry.io/otel v1.24.0
+	go.opentelemetry.io/otel/trace v1.24.0
 	golang.org/x/sync v0.7.0
 	golang.org/x/time v0.5.0
 )
@@ -56,7 +57,6 @@ require (
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.2.12 // indirect
 	go.opentelemetry.io/otel/metric v1.24.0 // indirect
-	go.opentelemetry.io/otel/trace v1.24.0 // indirect
 	go.uber.org/atomic v1.9.0 // indirect
 	go.uber.org/multierr v1.9.0 // indirect
 	golang.org/x/arch v0.8.0 // indirect

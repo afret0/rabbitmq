@@ -126,3 +126,15 @@ producer.PublishDelay(ctx, "order.created", data, 5) // 5 秒后投递
 ```
 
 注意单位不一致：`PublishDelay` 的 `delay` 单位是**秒**，而 `broker.Queue.RetryQueue`（重试退避队列）里的值单位是**毫秒**。
+
+## 链路追踪
+
+`NewJob` 内置了 OpenTelemetry 埋点，由环境变量 **`TRACE`** 控制开关（取值 `true` / `TRUE` / `1` / `yes` / `YES` 时开启），和 sample 里 `traceSvc.Init`、handler 用的是同一个开关。关闭时不会创建任何 span，也不会有额外开销。
+
+TracerProvider 仍由业务方在 worker 启动时初始化（如 `traceSvc.Init(cfg, svc)`），本库只负责生成 span。
+
+- 每条消息都会开启一条**全新的 trace**（`trace.WithNewRoot()`），不会和上游生产消息时的 trace 串在一起。
+- span 名为 `rabbitmq.Consume <handler 函数名>`，`SpanKind` 为 `consumer`。
+- span 属性：`msgId`（消息里的 `msgId`）、`opId`（同 `msgId`，与 producer 端 `Publish` 和 sample handler 的字段命名保持一致）、`job`、`hostId`。
+- 消息反序列化失败或 handler 返回错误时，会记录到 span 上并把状态置为 `Error`。
+- span 通过 ctx 传递给 handler，handler 内继续 `otel.Tracer(...).Start(ctx, ...)` 即可挂到同一条链路上。

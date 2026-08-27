@@ -6,15 +6,30 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"reflect"
+	"runtime"
+	"strings"
 	"time"
 
 	"github.com/afret0/wheel/tool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/afret0/rabbitmq/broker"
 	log2 "github.com/afret0/wheel/log"
 )
+
+const tracerName = "rabbitmq"
+
+// traceEnvKey 与 sample 中 traceSvc.Init 的开关一致：环境变量 TRACE。
+const traceEnvKey = "TRACE"
+
+// tool.HostId() 在没有 HOSTNAME 时每次都会生成新的 uuid，这里只取一次，保证同一进程内稳定。
+var hostId = tool.HostId()
 
 var RetryError = errors.New("job retry")
 
@@ -63,9 +78,16 @@ type Message[T any] struct {
 }
 
 func NewJob[T any](f func(ctx context.Context, p T) error) Job {
+	name := handlerName(f)
 	return func(msgS []byte) error {
 		c1, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+
+		c1, span := startConsumeSpan(c1, name)
+		if span != nil {
+			defer span.End()
+		}
+
 		lg1 := log2.CtxLogger(c1).WithFields(logrus.Fields{})
 		if tool.Debug() {
 			lg1.Printf("receive msg: %s", string(msgS))
@@ -75,10 +97,12 @@ func NewJob[T any](f func(ctx context.Context, p T) error) Job {
 		err := tool.Unmarshal(string(msgS), M)
 		if err != nil {
 			lg1.Printf("unmarshal message error: %s, msg: %s", err, string(msgS))
+			recordSpanError(span, err)
 			return err
 		}
 
 		ctx := context.WithValue(c1, "opId", M.MsgId)
+		setSpanMsgId(span, M.MsgId)
 		lg := log2.CtxLogger(ctx).WithFields(logrus.Fields{})
 		if tool.Debug() {
 			lg.Infof("start process message: %s", string(msgS))
@@ -87,6 +111,7 @@ func NewJob[T any](f func(ctx context.Context, p T) error) Job {
 		err = f(ctx, M.Data)
 		if err != nil {
 			lg.Errorf("process message error: %s", err)
+			recordSpanError(span, err)
 			return err
 		}
 
@@ -96,6 +121,75 @@ func NewJob[T any](f func(ctx context.Context, p T) error) Job {
 
 		return nil
 	}
+}
+
+// startConsumeSpan 为每条消息开启一个全新的 trace。
+// WithNewRoot 保证 worker 不会复用上游生产消息时的 trace，
+// 即每次消费到的新消息都是独立的一条链路。
+// 是否开启由环境变量 TRACE 控制（与 sample 中 traceSvc.Init 的开关一致），
+// 未开启时返回 nil span，调用方需要判空。
+func startConsumeSpan(ctx context.Context, name string) (context.Context, trace.Span) {
+	if !traceEnabled() {
+		return ctx, nil
+	}
+
+	ctx, span := otel.Tracer(tracerName).Start(
+		ctx,
+		fmt.Sprintf("rabbitmq.Consume %s", name),
+		trace.WithNewRoot(),
+		trace.WithSpanKind(trace.SpanKindConsumer),
+	)
+	span.SetAttributes(
+		attribute.String("job", name),
+		attribute.String("hostId", hostId),
+	)
+	return ctx, span
+}
+
+// traceEnabled 复用 sample 里 traceSvc.Init / handler 使用的 TRACE 环境变量开关，
+// 取值 true/TRUE/1/yes/YES 时开启。
+func traceEnabled() bool {
+	return tool.EnvEnabled(traceEnvKey)
+}
+
+// setSpanMsgId 把消息的 msgId 挂到 span 上，
+// 同时写入 opId 属性，和 producer 端 Publish、sample handler 的字段命名保持一致。
+func setSpanMsgId(span trace.Span, msgId string) {
+	if span == nil || msgId == "" {
+		return
+	}
+	span.SetAttributes(
+		attribute.String("msgId", msgId),
+		attribute.String("opId", msgId),
+	)
+}
+
+func recordSpanError(span trace.Span, err error) {
+	if span == nil || err == nil {
+		return
+	}
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+}
+
+// handlerName 取业务 handler 的函数名作为 span 名，方便在链路上区分不同的 job。
+func handlerName(f interface{}) string {
+	v := reflect.ValueOf(f)
+	if v.Kind() != reflect.Func || v.Pointer() == 0 {
+		return "unknown"
+	}
+
+	fn := runtime.FuncForPC(v.Pointer())
+	if fn == nil {
+		return "unknown"
+	}
+
+	name := fn.Name()
+	if idx := strings.LastIndex(name, "/"); idx >= 0 {
+		name = name[idx+1:]
+	}
+	name = strings.TrimSuffix(name, "-fm")
+	return name
 }
 
 //type params struct {
