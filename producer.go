@@ -64,3 +64,11 @@ func (p *Producer) PublishDelay(ctx context.Context, key string, data interface{
 	}
 	return p.broker.PublishDelay(ctx, key, body, delaySeconds)
 }
+
+// Close 关闭连接，最多等待 10s。之后 Publish 返回错误。
+func (p *Producer) Close() error {
+	if c, ok := p.broker.(interface{ Close() error }); ok {
+		return c.Close()
+	}
+	return nil
+}

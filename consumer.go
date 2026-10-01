@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/afret0/wheel/tool"
@@ -20,6 +21,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/afret0/rabbitmq/broker"
+	"github.com/afret0/rabbitmq/internal/backoff"
 	log2 "github.com/afret0/wheel/log"
 )
 
@@ -46,6 +48,9 @@ type ConsumerOptions struct {
 
 type Consumer struct {
 	broker broker.Broker
+
+	stopOnce sync.Once
+	stop     chan struct{}
 	//log *log.Logger
 	//config    *viper.Viper
 	// metrics struct {
@@ -60,7 +65,7 @@ func NewConsumer(opt *ConsumerOptions) *Consumer {
 		ExchangeType: opt.ExchangeOpt.Type,
 	})
 
-	consumer := &Consumer{broker: b}
+	consumer := &Consumer{broker: b, stop: make(chan struct{})}
 	// metrics.MustInit(&consumer.metrics, prometheus.New())
 
 	//go func() {
@@ -242,53 +247,43 @@ func LimitPerSecond(n int) *LaunchJobOpt {
 	return broker.PerSecond(n)
 }
 
-// RetryAfter 配置重试退避序列：handler 返回 RetryError 时，
-// 第 n 次重试等待 delays[n]，用尽后不再重试。
+// RetryAfter 曾用于配置重试退避序列。
 //
-//	consumer.LaunchJob(key, queue, job, RetryAfter(time.Second, 5*time.Second))
+// Deprecated: 不再生效。handler 返回 RetryError（含 errors.Is 可识别的包装错误）或 panic 时，
+// 统一按 1s / 5s / 10s 退避重投，同一条消息最多重投 3 次，之后丢弃（队列配置了死信则进入死信）
+// 并打印一条日志。保留该函数仅为兼容旧代码编译。
 func RetryAfter(delays ...time.Duration) *LaunchJobOpt {
 	return (&LaunchJobOpt{}).WithRetry(delays...)
 }
 
+// LaunchJob 持续消费 queue（绑定 key），阻塞直到 Shutdown。
+// 连接断开、channel 被关闭等错误会按带抖动的指数退避（约 0.5s 起、最长 30s）自动重建消费。
+//
+// handler 返回 RetryError 或 panic 时按 1s / 5s / 10s 退避重投，同一条消息最多重投 3 次，
+// 之后丢弃（队列配置了死信则进入死信）并打印一条日志；返回其他错误或 nil 都会 ack。
 func (c *Consumer) LaunchJob(key, queue string, job Job, optChain ...*LaunchJobOpt) {
-	retryQueue := make([]int64, 0)
-	if len(optChain) > 0 && optChain[0] != nil {
-		retryQueue = optChain[0].RetryQueueMillis()
+	if len(optChain) > 0 && optChain[0] != nil && len(optChain[0].Retry) > 0 {
+		log.Printf("job %s: RetryAfter is deprecated and ignored, failed messages are redelivered after 1s/5s/10s (at most 3 times)", queue)
 	}
 
 	q := &broker.Queue{
-		Name:       queue,
-		RouteKey:   key,
-		RetryQueue: retryQueue,
+		Name:     queue,
+		RouteKey: key,
 		Handle: func(body []byte) broker.Status {
-			var err error
-
-			defer func(begin time.Time) {
-				// c.metrics.JobHandleDuration.ObserveWith(map[string]string{
-				// 	"name": queue,
-				// 	"Err":  fmt.Sprintf("%v", Err),
-				// }, time.Since(begin).Seconds())
-			}(time.Now())
-
-			switch err = job(body); err {
-			case RetryError:
+			if errors.Is(job(body), RetryError) {
 				return broker.Retry
-			default:
-				return broker.Success
 			}
+			return broker.Success
 		},
 	}
 
-	for {
-		log.Printf("job %s start consume...", queue)
-		if err := c.broker.Consume(q, optChain...); err != nil {
-			log.Printf("job %s consume error: %v ,retrying consume after 30s", queue, err)
-			time.Sleep(30 * time.Second)
-		}
-	}
+	c.runForever(fmt.Sprintf("job %s", queue), func() error {
+		return c.broker.Consume(q, optChain...)
+	})
 }
 
 // LaunchTopicJob  group: 即队列名, topic: routing key
+// 阻塞直到 Shutdown，重建消费与重投语义同 LaunchJob。
 func (c *Consumer) LaunchTopicJob(group string, topic string, job Job) {
 
 	if group == "" {
@@ -303,24 +298,77 @@ func (c *Consumer) LaunchTopicJob(group string, topic string, job Job) {
 
 	handle := func(body []byte) broker.Status {
 		if tool.Debug() {
-			log.Printf("group: %s, topic: %s, hostId: %s, receive msg: %s", group, topic, tool.HostId(), body)
+			log.Printf("group: %s, topic: %s, hostId: %s, receive msg: %s", group, topic, hostId, body)
 		}
 
-		switch err := job(body); err {
-		case RetryError:
+		if errors.Is(job(body), RetryError) {
 			return broker.Retry
-		default:
-			return broker.Success
 		}
+		return broker.Success
 	}
 
-	for {
-		log.Printf("group: %s, topic: %s, hostId: %s, start consume...", group, topic, tool.HostId())
-		if err := c.broker.ConsumerTopic(opt, handle); err != nil {
-			log.Printf("group: %s, topic: %s, hostId: %s, consume error: %v ,retrying consume after 30s", group, topic, tool.HostId(), err)
-			time.Sleep(30 * time.Second)
-		}
+	c.runForever(fmt.Sprintf("group: %s, topic: %s, hostId: %s,", group, topic, hostId), func() error {
+		return c.broker.ConsumerTopic(opt, handle)
+	})
+}
 
+// runForever 反复执行一次消费会话，直到 Shutdown。
+// 会话运行超过 1 分钟视为稳定，退避从头开始；否则逐步拉长，避免持续失败时空转、
+// 以及 broker 重启后所有 Pod 同时重建消费造成惊群。
+func (c *Consumer) runForever(name string, consume func() error) {
+	bo := backoff.New(time.Second, 30*time.Second)
+	for {
+		if c.stopped() {
+			log.Printf("%s stopped", name)
+			return
+		}
+		log.Printf("%s start consume...", name)
+		start := time.Now()
+		err := consume()
+		if errors.Is(err, broker.ErrShutdown) || c.stopped() {
+			log.Printf("%s stopped", name)
+			return
+		}
+		if time.Since(start) > time.Minute {
+			bo.Reset()
+		}
+		wait := bo.Next()
+		log.Printf("%s consume error: %v ,retrying consume after %v", name, err, wait)
+		t := time.NewTimer(wait)
+		select {
+		case <-t.C:
+		case <-c.stopCh():
+			t.Stop()
+		}
+	}
+}
+
+// Shutdown 优雅停机，适合在 k8s 收到 SIGTERM 时调用：
+// 停止接收新消息，等待在途消息处理并确认（受 ctx 约束），然后关闭连接；
+// LaunchJob / LaunchTopicJob 随之返回。预取但未处理的消息由 broker 重新入队给其他实例。
+func (c *Consumer) Shutdown(ctx context.Context) error {
+	c.stopOnce.Do(func() {
+		if c.stop == nil {
+			c.stop = make(chan struct{})
+		}
+		close(c.stop)
+	})
+	if s, ok := c.broker.(interface{ Shutdown(context.Context) error }); ok {
+		return s.Shutdown(ctx)
+	}
+	return nil
+}
+
+func (c *Consumer) stopCh() <-chan struct{} {
+	return c.stop
+}
+
+func (c *Consumer) stopped() bool {
+	select {
+	case <-c.stop:
+		return true
+	default:
+		return false
 	}
 }
 

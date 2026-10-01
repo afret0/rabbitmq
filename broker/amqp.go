@@ -2,7 +2,6 @@ package broker
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -13,12 +12,10 @@ import (
 	"github.com/streadway/amqp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"golang.org/x/time/rate"
 )
 
-// publishConfirmTimeout 是等待 broker publisher confirm 的超时时间。
-// 超时会被当作发送失败返回，避免在 broker 侧静默丢消息。
-const publishConfirmTimeout = 5 * time.Second
+// shutdownTimeout 是 Close 等待在途消息处理完成的上限。
+const shutdownTimeout = 10 * time.Second
 
 type AmqpBrokerOptions struct {
 	Url          string
@@ -26,202 +23,68 @@ type AmqpBrokerOptions struct {
 	ExchangeType string
 }
 
+// AmqpBroker 是 Broker 的 RabbitMQ 实现。
+//
+// 连接划分：
+//   - main：NewAmqpBroker 时建立。只用于发布的实例（Producer）在它上面发布；
+//     一旦开始消费，它就只用于消费，从不发布，因此不会被 broker 的内存/磁盘告警阻塞，
+//     ack 与消费不受发布侧影响。
+//   - side：懒加载的独立连接，发布消费失败的重投消息；同一实例既消费又发布时，业务发布也走这里。
 type AmqpBroker struct {
-	m        sync.Mutex
-	conn     *amqp.Connection
-	notifies map[string]chan *amqp.Error
-	options  *AmqpBrokerOptions
+	options *AmqpBrokerOptions
 
-	// publish 路径独立状态，开启 publisher confirm 后保证消息真正落地
-	pubMu     sync.Mutex
-	pubCh     *amqp.Channel
-	pubAck    chan amqp.Confirmation
-	pubReturn chan amqp.Return
-	pubClosed chan *amqp.Error
-	// pubSeq 跟踪当前 channel 上下一条 publish 的 DeliveryTag（从 1 开始），
-	// 用来与 confirm 一一配对，发现错位立刻报错。channel 重建时归零。
-	pubSeq uint64
+	main *connManager
+	pub  *publisher
+
+	ctx    context.Context // Shutdown 时取消
+	cancel context.CancelFunc
+
+	mu           sync.Mutex
+	shutdown     bool
+	connsClosed  bool
+	consuming    bool
+	sessions     sync.WaitGroup
+	sessionsOnce sync.Once
+	sessionsDone chan struct{}
+	sideConn     *connManager
+	retryPub     *publisher
+	sidePub      *publisher
 }
 
 func NewAmqpBroker(option *AmqpBrokerOptions) *AmqpBroker {
-	conn, err := amqp.Dial(option.Url)
-	if err != nil {
+	main := newConnManager(option.Url, "main")
+	if err := main.connect(); err != nil {
 		panic(err)
 	}
-
-	ab := &AmqpBroker{
-		conn:     conn,
-		options:  option,
-		notifies: make(map[string]chan *amqp.Error),
+	ctx, cancel := context.WithCancel(context.Background())
+	pub := newPublisher(main, publishConfirmTimeout)
+	pub.exchange = &exchangeDecl{name: option.Exchange, kind: option.ExchangeType}
+	return &AmqpBroker{
+		options: option,
+		main:    main,
+		pub:     pub,
+		ctx:     ctx,
+		cancel:  cancel,
 	}
-
-	go ab.keepAlive()
-
-	return ab
-}
-
-func (a *AmqpBroker) keepAlive() {
-	a.m.Lock()
-	conn := a.conn
-	a.m.Unlock()
-
-	if conn != nil {
-		cc := conn.NotifyClose(make(chan *amqp.Error))
-		log.Printf("amqp conn close: %v", <-cc)
-	}
-
-	newConn, err := amqp.Dial(a.options.Url)
-	if err != nil {
-		log.Printf("amqp redial faild: %v", err)
-		time.AfterFunc(5*time.Second, a.keepAlive)
-		return
-	}
-	log.Println("amqp redial success...")
-
-	a.m.Lock()
-	a.conn = newConn
-	notifies := make([]chan *amqp.Error, 0, len(a.notifies))
-	for _, n := range a.notifies {
-		notifies = append(notifies, n)
-	}
-	a.m.Unlock()
-
-	// 重连后强制重建 publish channel
-	a.resetPubChannel()
-
-	for _, n := range notifies {
-		select {
-		case n <- amqp.ErrClosed:
-		default:
-		}
-	}
-	a.keepAlive()
 }
 
 func (a *AmqpBroker) Health() bool {
-	a.m.Lock()
-	defer a.m.Unlock()
-	return a.conn != nil && !a.conn.IsClosed()
+	return a.main.healthy()
 }
 
-// errDeliveryClosed 表示 broker 关闭了投递通道, 需要由上层重新发起消费。
-var errDeliveryClosed = errors.New("delivery channel closed")
-
-// consumeLoop 按限流节奏消费 delivery。
+// Consume 持续消费 queue，直到 channel / 连接关闭（返回非 nil error，由调用方重建消费）
+// 或 Shutdown（返回 ErrShutdown）。
 //
-// 返回值恒为非 nil：delivery 被关闭或收到连接关闭通知都需要上层重连，
-// 返回 nil 会让调用方的重连循环误判为正常结束而空转。
-func consumeLoop(
-	ctx context.Context,
-	delivery <-chan amqp.Delivery,
-	notify <-chan *amqp.Error,
-	limiter *rate.Limiter,
-	handle func(amqp.Delivery),
-) error {
-	for {
-		select {
-		case err := <-notify:
-			if err != nil {
-				return err
-			}
-			return amqp.ErrClosed
-		case d, ok := <-delivery:
-			// 通道关闭后接收会立即返回零值, 必须退出,
-			// 否则会空转并对零值消息反复调用 handle。
-			if !ok {
-				return errDeliveryClosed
-			}
-			if limiter != nil {
-				if err := limiter.Wait(ctx); err != nil {
-					return err
-				}
-			}
-			handle(d)
-		}
-	}
-}
-
+// handler 返回 Retry 或 panic 时，消息按 1s / 5s / 10s 退避重投，同一条消息最多重投 3 次，
+// 之后丢弃（队列配置了死信则进入死信）并打印一条日志。Queue.RetryQueue 已废弃，不再生效。
 func (a *AmqpBroker) Consume(queue *Queue, optChain ...*ConsumeOption) error {
-
 	opt := normalize(optChain...)
-	ctx := context.Background()
-
-	a.m.Lock()
-	conn := a.conn
-	a.m.Unlock()
-	if conn == nil {
-		return errors.New("conn is nil")
-	}
-	channel, err := conn.Channel()
-	if err != nil {
-		return err
-	}
-	defer channel.Close()
-
-	if err := channel.ExchangeDeclare(
-		a.options.Exchange,
-		a.options.ExchangeType,
-		true, false, false, false, nil,
-	); err != nil {
-		return err
-	}
-	if _, err := channel.QueueDeclare(queue.Name,
-		true, false, false, false, nil,
-	); err != nil {
-		return err
-	}
-	if err := channel.Qos(opt.Prefetch, 0, false); err != nil {
-		return err
-	}
-
-	if err := channel.QueueBind(queue.Name, queue.RouteKey, a.options.Exchange, false, nil); err != nil {
-		return err
-	}
-
-	delivery, err := channel.Consume(queue.Name, "", false, false, false, false, nil)
-	if err != nil {
-		return err
-	}
-
-	notify := make(chan *amqp.Error, 1)
-
-	a.m.Lock()
-	a.notifies[queue.Name] = notify
-	a.m.Unlock()
-
-	// 只摘除注册、不 close：keepAlive 可能仍持有该 channel 的引用，
-	// close 后再写入会 panic。
-	defer func() {
-		a.m.Lock()
-		delete(a.notifies, queue.Name)
-		a.m.Unlock()
-	}()
-
-	return consumeLoop(ctx, delivery, notify, newLimiter(opt), func(d amqp.Delivery) {
-		switch status := queue.Handle(d.Body); status {
-		case Retry:
-			scheduled, err := a.retry(queue, d)
-			if err != nil {
-				log.Printf("queue %s schedule retry failed: %v, requeue", queue.Name, err)
-			}
-
-			switch retryAction(scheduled, err, len(queue.RetryQueue) > 0) {
-			case actionAck:
-				d.Ack(false)
-			case actionReject:
-				log.Printf("queue %s retry exhausted after %d attempts, rejecting message",
-					queue.Name, len(queue.RetryQueue))
-				d.Nack(false, false)
-			default:
-				if err == nil && len(queue.RetryQueue) == 0 {
-					log.Printf("queue %s asked to retry but no retry backoff configured, "+
-						"requeueing immediately; consider RetryAfter(...)", queue.Name)
-				}
-				d.Nack(false, true)
-			}
-		default:
-			d.Ack(false)
-		}
+	return a.runSession(sessionSpec{
+		queue:    queue.Name,
+		bindings: []string{queue.RouteKey},
+		prefetch: opt.Prefetch,
+		limiter:  newLimiter(opt),
+		handle:   queue.Handle,
 	})
 }
 
@@ -231,223 +94,118 @@ type GroupConsumeOption struct {
 	Prefetch    int      // 每实例并行未 Ack 上限
 }
 
+// ConsumerTopic 以消费组方式消费：同组的多个实例共享以 Group 命名的队列。
+// 返回值与重投语义同 Consume。
 func (a *AmqpBroker) ConsumerTopic(opt *GroupConsumeOption, handle func([]byte) Status) error {
-	a.m.Lock()
-	conn := a.conn
-	a.m.Unlock()
-	if conn == nil {
-		return fmt.Errorf("conn is nil")
-	}
 	if opt.Group == "" || len(opt.RoutingKeys) == 0 {
 		return fmt.Errorf("group or routing keys empty")
 	}
-
-	ch, err := conn.Channel()
-	if err != nil {
-		return err
-	}
-	defer ch.Close()
-
-	// 1. 声明 topic exchange（幂等）
-	if err := ch.ExchangeDeclare(a.options.Exchange, a.options.ExchangeType, true, false, false, false, nil); err != nil {
-		return err
-	}
-
-	// 2. 队列名（同组保证一致）
-	queueName := opt.Group
-
-	// 3. 声明共享队列（持久化, 不自动删除）
-	if _, err := ch.QueueDeclare(queueName, true, false, false, false, nil); err != nil {
-		return err
-	}
-
-	// 4. 绑定多个 routing key（可含 \* 或 \# 通配）
-	for _, rk := range opt.RoutingKeys {
-		if err := ch.QueueBind(queueName, rk, a.options.Exchange, false, nil); err != nil {
-			return err
-		}
-	}
-
-	// 5. QoS
 	prefetch := opt.Prefetch
 	if prefetch <= 0 {
-		prefetch = 10
+		prefetch = defaultPrefetch
 	}
-	if err := ch.Qos(prefetch, 0, false); err != nil {
-		return err
+	h := handle
+	if os.Getenv("DEBUG") == "TRUE" {
+		h = func(body []byte) Status {
+			log.Printf("AmqpBroker ConsumerTopic receive msg: %s", body)
+			return handle(body)
+		}
 	}
+	return a.runSession(sessionSpec{
+		queue:    opt.Group,
+		bindings: opt.RoutingKeys,
+		prefetch: prefetch,
+		handle:   h,
+	})
+}
 
-	// 6. 开始消费（手动 Ack）
-	delivery, err := ch.Consume(queueName, "", false, false, false, false, nil)
+func (a *AmqpBroker) scheduleRedelivery(queue string, d amqp.Delivery, next int, delay time.Duration) error {
+	pub, err := a.retryPublisher()
 	if err != nil {
 		return err
 	}
-
-	for d := range delivery {
-		if debug := os.Getenv("DEBUG"); debug == "TRUE" {
-			log.Printf("AmqpBroker ConsumerTopic receive msg: %s", d.Body)
-		}
-		retry := handle(d.Body)
-		if retry == Retry {
-			// 可接你现有的延迟重试逻辑
-			d.Nack(false, true) // 直接 requeue 简易重试（可能导致顺序抖动）
-			continue
-		}
-		d.Ack(false)
-	}
-
-	return nil
+	decl := delayQueueDecl(queue, delay)
+	return pub.publish(context.Background(), pubRequest{
+		exchange:  "",
+		key:       decl.name,
+		mandatory: true,
+		msg:       redeliveryPublishing(d, next),
+		declare:   decl,
+	})
 }
 
-// retry 把消息投递到延迟队列以便稍后重投。
-//
-// 返回 scheduled 表示是否真的调度了一次重试：
-// 未配置 RetryQueue 或重试次数已用尽时返回 (false, nil)，
-// 调用方必须据此决定回执，不能当作成功而 Ack，否则消息会被静默丢弃。
-func (a *AmqpBroker) retry(queue *Queue, d amqp.Delivery) (scheduled bool, err error) {
-	retryCount, _ := d.Headers["x-retry-count"].(int32)
-
-	if int(retryCount) >= len(queue.RetryQueue) {
-		return false, nil
+// retryPublisher 返回发布重投消息的发布器。连接被阻塞时立即失败，由调用方进程内兜底。
+func (a *AmqpBroker) retryPublisher() (*publisher, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.connsClosed {
+		return nil, ErrShutdown
 	}
-
-	a.m.Lock()
-	conn := a.conn
-	a.m.Unlock()
-	if conn == nil {
-		return false, errors.New("conn is nil")
+	if a.retryPub == nil {
+		a.retryPub = newPublisher(a.sideConnLocked(), publishConfirmTimeout)
+		a.retryPub.failFastBlocked = true
 	}
-	channel, err := conn.Channel()
-	if err != nil {
-		return false, err
-	}
-	defer channel.Close()
-
-	delay := queue.RetryQueue[retryCount]
-	delayDuration := time.Duration(delay) * time.Millisecond
-	delayQ := fmt.Sprintf("delay.%s.%s.%s", delayDuration.String(), a.options.Exchange, queue.Name)
-
-	if _, err := channel.QueueDeclare(delayQ,
-		true, false, false, false, amqp.Table{
-			"x-dead-letter-exchange":    a.options.Exchange,
-			"x-dead-letter-routing-key": queue.RouteKey,
-			"x-message-ttl":             delay,
-			"x-expires":                 delay * 2,
-		},
-	); err != nil {
-		return false, err
-	}
-
-	if err := channel.Publish("", delayQ, false, false, amqp.Publishing{
-		Headers:      amqp.Table{"x-retry-count": retryCount + 1},
-		Body:         d.Body,
-		DeliveryMode: amqp.Persistent,
-	}); err != nil {
-		return false, err
-	}
-
-	return true, nil
+	return a.retryPub, nil
 }
 
-// ensurePubChannelLocked 必须在持有 a.pubMu 的情况下调用。
-// 它返回一个开启了 publisher confirm 的长生命周期 channel，以及该 channel 上的 ack / return 通知 channel。
-func (a *AmqpBroker) ensurePubChannelLocked() (*amqp.Channel, chan amqp.Confirmation, chan amqp.Return, error) {
-	if a.pubCh != nil {
-		select {
-		case err, ok := <-a.pubClosed:
-			if ok && err != nil {
-				log.Printf("amqp publish channel closed: %v, will recreate", err)
-			}
-			a.pubCh = nil
-			a.pubAck = nil
-			a.pubReturn = nil
-			a.pubClosed = nil
-		default:
-			return a.pubCh, a.pubAck, a.pubReturn, nil
-		}
+// producerPublisher 返回业务发布使用的发布器：实例开始消费后切换到独立连接，避免发布被阻塞时拖住消费。
+func (a *AmqpBroker) producerPublisher() *publisher {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.consuming || a.connsClosed {
+		return a.pub
 	}
-
-	a.m.Lock()
-	conn := a.conn
-	a.m.Unlock()
-	if conn == nil || conn.IsClosed() {
-		return nil, nil, nil, errors.New("amqp connection is not ready")
+	if a.sidePub == nil {
+		a.sidePub = newPublisher(a.sideConnLocked(), publishConfirmTimeout)
+		a.sidePub.exchange = a.pub.exchange
 	}
-
-	ch, err := conn.Channel()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	if err := ch.ExchangeDeclare(
-		a.options.Exchange,
-		a.options.ExchangeType,
-		true, false, false, false, nil,
-	); err != nil {
-		_ = ch.Close()
-		return nil, nil, nil, err
-	}
-
-	if err := ch.Confirm(false); err != nil {
-		_ = ch.Close()
-		return nil, nil, nil, err
-	}
-
-	a.pubCh = ch
-	a.pubAck = ch.NotifyPublish(make(chan amqp.Confirmation, 256))
-	a.pubReturn = ch.NotifyReturn(make(chan amqp.Return, 16))
-	a.pubClosed = ch.NotifyClose(make(chan *amqp.Error, 1))
-	a.pubSeq = 0
-	return a.pubCh, a.pubAck, a.pubReturn, nil
+	return a.sidePub
 }
 
-func (a *AmqpBroker) resetPubChannelLocked() {
-	if a.pubCh != nil {
-		_ = a.pubCh.Close()
+func (a *AmqpBroker) sideConnLocked() *connManager {
+	if a.sideConn == nil {
+		a.sideConn = newConnManager(a.options.Url, "side")
 	}
-	a.pubCh = nil
-	a.pubAck = nil
-	a.pubReturn = nil
-	a.pubClosed = nil
-	a.pubSeq = 0
-}
-
-func (a *AmqpBroker) resetPubChannel() {
-	a.pubMu.Lock()
-	defer a.pubMu.Unlock()
-	a.resetPubChannelLocked()
+	return a.sideConn
 }
 
 // DeclareQueue 在 publisher 启动 / 首次发送时声明队列并绑定到 exchange，
 // 避免 consumer 尚未启动时出现 unroutable 静默丢消息。幂等。
 func (a *AmqpBroker) DeclareQueue(name, routingKey string) error {
-	a.m.Lock()
-	conn := a.conn
-	a.m.Unlock()
-	if conn == nil || conn.IsClosed() {
-		return errors.New("amqp connection is not ready")
-	}
-	ch, err := conn.Channel()
+	ctx, cancel := context.WithTimeout(context.Background(), publishConfirmTimeout)
+	defer cancel()
+	conn, gen, err := a.main.get(ctx)
 	if err != nil {
-		return err
-	}
-	defer ch.Close()
-
-	if err := ch.ExchangeDeclare(
-		a.options.Exchange, a.options.ExchangeType,
-		true, false, false, false, nil,
-	); err != nil {
-		return err
-	}
-	if _, err := ch.QueueDeclare(name, true, false, false, false, nil); err != nil {
-		return err
+		return mapWaitErr(context.Background(), err, errNotConnected)
 	}
 	if routingKey == "" {
 		routingKey = name
 	}
-	return ch.QueueBind(name, routingKey, a.options.Exchange, false, nil)
+	return a.main.withWatchdog(gen, rpcTimeout, "declare queue "+name, func() error {
+		ch, err := conn.Channel()
+		if err != nil {
+			return err
+		}
+		defer ch.Close()
+
+		if err := ch.ExchangeDeclare(
+			a.options.Exchange, a.options.ExchangeType,
+			true, false, false, false, nil,
+		); err != nil {
+			return err
+		}
+		if _, err := ch.QueueDeclare(name, true, false, false, false, nil); err != nil {
+			return err
+		}
+		return ch.QueueBind(name, routingKey, a.options.Exchange, false, nil)
+	})
 }
 
+// Publish 发布消息并等待 broker 确认。
+//
+// 返回时间受 ctx 约束；ctx 没有 deadline 时，等待连接就绪 / 阻塞解除 / 确认各自最多 5s。
+// 连接被 broker 阻塞（内存/磁盘告警）且 5s 内未解除时返回 ErrBlocked。
+// 注意：返回超时类错误时消息仍可能已被投递（at-least-once），重发需业务幂等。
 func (a *AmqpBroker) Publish(ctx context.Context, key string, body []byte) error {
 	opId := tool.OpId(ctx)
 	hds := amqp.Table{"opId": opId}
@@ -463,101 +221,33 @@ func (a *AmqpBroker) Publish(ctx context.Context, key string, body []byte) error
 		)
 	}
 
-	a.pubMu.Lock()
-	defer a.pubMu.Unlock()
-
-	ch, confirms, returns, err := a.ensurePubChannelLocked()
-	if err != nil {
-		return err
-	}
-
-	// 记录本次 publish 对应的 DeliveryTag（broker 从 1 开始递增），
-	// 便于和后续 confirm 配对，发现错位立刻报错暴露问题。
-	a.pubSeq++
-	expectedTag := a.pubSeq
-
 	// mandatory=true: 路由不到队列时 broker 通过 basic.return 退回，
 	// 否则即便开启了 publisher confirm，broker 仍会返回 Ack=true 但消息已被丢弃。
-	if err := ch.Publish(a.options.Exchange, key, true, false, amqp.Publishing{
-		Headers:      hds,
-		ContentType:  "",
-		Body:         body,
-		DeliveryMode: amqp.Persistent,
-	}); err != nil {
-		a.resetPubChannelLocked()
-		return err
-	}
-
-	// 等待 broker 真正确认收到，避免 channel 关闭/网络层缓冲导致的静默丢失。
-	// 注意：confirms / returns 是按 publish 顺序与 channel 共享的串行队列，
-	// 任何提前返回都必须 reset channel，避免把残留的 confirm 错位给下一次调用。
-	select {
-	case c, ok := <-confirms:
-		if !ok {
-			a.resetPubChannelLocked()
-			return errors.New("amqp publish confirm channel closed")
-		}
-		if c.DeliveryTag != expectedTag {
-			a.resetPubChannelLocked()
-			return fmt.Errorf("amqp publish confirm out of order, want=%d got=%d", expectedTag, c.DeliveryTag)
-		}
-		if !c.Ack {
-			return fmt.Errorf("amqp message nacked, deliveryTag=%d", c.DeliveryTag)
-		}
-		// streadway/amqp 保证 basic.return 在 ack 之前到达，
-		// 这里非阻塞探测 returns，能精确识别 unroutable。
-		select {
-		case r := <-returns:
-			return fmt.Errorf("amqp message unroutable, replyCode=%d replyText=%s exchange=%s routingKey=%s",
-				r.ReplyCode, r.ReplyText, r.Exchange, r.RoutingKey)
-		default:
-			return nil
-		}
-	case r := <-returns:
-		// return 帧到达后 ack 紧随其后，但仍要带超时兜底防止阻塞。
-		select {
-		case <-confirms:
-		case <-time.After(publishConfirmTimeout):
-			a.resetPubChannelLocked()
-		}
-		return fmt.Errorf("amqp message unroutable, replyCode=%d replyText=%s exchange=%s routingKey=%s",
-			r.ReplyCode, r.ReplyText, r.Exchange, r.RoutingKey)
-	case err := <-a.pubClosed:
-		a.resetPubChannelLocked()
-		if err != nil {
-			return err
-		}
-		return errors.New("amqp publish channel closed before confirm")
-	case <-time.After(publishConfirmTimeout):
-		a.resetPubChannelLocked()
-		return errors.New("amqp publish confirm timeout")
-	case <-ctx.Done():
-		// 必须 reset：否则未消费的 confirm 会留在 channel 上，
-		// 与下一次 Publish 错位，导致后续消息被静默"误判为成功"而真正丢失。
-		a.resetPubChannelLocked()
-		return ctx.Err()
-	}
+	return a.producerPublisher().publish(ctx, pubRequest{
+		exchange:  a.options.Exchange,
+		key:       key,
+		mandatory: true,
+		msg: amqp.Publishing{
+			Headers:      hds,
+			ContentType:  "",
+			Body:         body,
+			DeliveryMode: amqp.Persistent,
+		},
+	})
 }
 
 // PublishDelay 延迟投递, delaySeconds 单位为秒。
-// 内部换算为 AMQP 的 x-message-ttl(毫秒), 注意与 Queue.RetryQueue 的毫秒不同。
+// 内部换算为 AMQP 的 x-message-ttl(毫秒)。
+// delaySeconds <= 0 时等同于 Publish 立即投递。
 func (a *AmqpBroker) PublishDelay(ctx context.Context, queue string, body []byte, delaySeconds int64) error {
-	a.m.Lock()
-	conn := a.conn
-	a.m.Unlock()
-	if conn == nil {
-		return errors.New("conn is nil")
+	if delaySeconds <= 0 {
+		return a.Publish(ctx, queue, body)
 	}
-
-	channel, err := conn.Channel()
-	if err != nil {
-		return err
-	}
-	defer channel.Close()
 
 	delayQ := fmt.Sprintf("delay.%d.%s.%s", delaySeconds, a.options.Exchange, queue)
 
 	opId := tool.OpId(ctx)
+	// 队列参数必须与旧版本完全一致，否则滚动升级期间新旧 Pod 声明同名队列会 PRECONDITION_FAILED
 	hd := amqp.Table{
 		"opId":                      opId,
 		"x-dead-letter-exchange":    a.options.Exchange,
@@ -578,43 +268,76 @@ func (a *AmqpBroker) PublishDelay(ctx context.Context, queue string, body []byte
 		)
 	}
 
-	if _, err := channel.QueueDeclare(delayQ,
-		true, true, false, false, hd,
-	); err != nil {
-		return err
-	}
+	// 延迟队列依赖 x-expires 自动清理，每次发布前都重新声明以续期（cacheFor=0），
+	// 否则队列可能在消息到期前过期，消息随之丢失。
+	return a.producerPublisher().publish(ctx, pubRequest{
+		exchange:  "",
+		key:       delayQ,
+		mandatory: true,
+		msg: amqp.Publishing{
+			Headers:      amqp.Table{"opId": opId},
+			Body:         body,
+			DeliveryMode: amqp.Persistent,
+		},
+		declare: &queueDecl{name: delayQ, durable: true, autoDelete: true, args: hd},
+	})
+}
 
-	if err := channel.Confirm(false); err != nil {
-		return err
-	}
-	confirms := channel.NotifyPublish(make(chan amqp.Confirmation, 1))
-	closed := channel.NotifyClose(make(chan *amqp.Error, 1))
+// Shutdown 优雅停机：停止接收新消息，等待在途消息处理并确认完成（受 ctx 约束），然后关闭连接。
+// 未处理的预取消息随 channel 关闭由 broker 重新入队，交给其他实例处理。
+// 适合在 k8s 收到 SIGTERM 后调用。可重复调用。
+func (a *AmqpBroker) Shutdown(ctx context.Context) error {
+	a.mu.Lock()
+	a.shutdown = true
+	a.mu.Unlock()
+	a.cancel()
 
-	if err := channel.Publish("", delayQ, false, false, amqp.Publishing{
-		Headers:      amqp.Table{"opId": opId},
-		Body:         body,
-		DeliveryMode: amqp.Persistent,
-	}); err != nil {
-		return err
-	}
-
+	// 多次超时调用 Shutdown 时只保留一个等待 goroutine
+	a.sessionsOnce.Do(func() {
+		a.sessionsDone = make(chan struct{})
+		go func() {
+			a.sessions.Wait()
+			close(a.sessionsDone)
+		}()
+	})
+	var err error
 	select {
-	case c, ok := <-confirms:
-		if !ok {
-			return errors.New("amqp publish confirm channel closed")
-		}
-		if !c.Ack {
-			return fmt.Errorf("amqp delay message nacked, deliveryTag=%d", c.DeliveryTag)
-		}
-		return nil
-	case err := <-closed:
-		if err != nil {
-			return err
-		}
-		return errors.New("amqp publish channel closed before confirm")
-	case <-time.After(publishConfirmTimeout):
-		return errors.New("amqp publish confirm timeout")
+	case <-a.sessionsDone:
 	case <-ctx.Done():
-		return ctx.Err()
+		err = ctx.Err()
 	}
+
+	a.mu.Lock()
+	a.connsClosed = true
+	sideConn := a.sideConn
+	a.mu.Unlock()
+	if sideConn != nil {
+		sideConn.close()
+	}
+	a.main.close()
+	return err
+}
+
+// Close 等同于 Shutdown，最多等待 10s。
+func (a *AmqpBroker) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	return a.Shutdown(ctx)
+}
+
+func (a *AmqpBroker) enterSession() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.shutdown {
+		return false
+	}
+	a.consuming = true
+	a.sessions.Add(1)
+	return true
+}
+
+func (a *AmqpBroker) isShutdown() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.shutdown
 }

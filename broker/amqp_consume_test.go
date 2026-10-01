@@ -9,14 +9,14 @@ import (
 )
 
 // 投递通道关闭后必须退出, 否则会空转并对零值消息反复调用 handle。
-func Test_consumeLoop_ReturnsWhenDeliveryClosed(t *testing.T) {
+func Test_deliveryLoop_ReturnsWhenDeliveryClosed(t *testing.T) {
 	delivery := make(chan amqp.Delivery)
 	close(delivery)
 
 	handled := 0
 	done := make(chan error, 1)
 	go func() {
-		done <- consumeLoop(context.Background(), delivery, make(chan *amqp.Error, 1), nil,
+		done <- deliveryLoop(context.Background(), delivery, nil,
 			func(amqp.Delivery) { handled++ })
 	}()
 
@@ -26,7 +26,7 @@ func Test_consumeLoop_ReturnsWhenDeliveryClosed(t *testing.T) {
 			t.Fatal("expected non-nil error so the caller reconnects")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("consumeLoop did not return on closed delivery channel (busy loop)")
+		t.Fatal("deliveryLoop did not return on closed delivery channel (busy loop)")
 	}
 
 	if handled != 0 {
@@ -34,29 +34,35 @@ func Test_consumeLoop_ReturnsWhenDeliveryClosed(t *testing.T) {
 	}
 }
 
-func Test_consumeLoop_ReturnsOnNotify(t *testing.T) {
-	notify := make(chan *amqp.Error, 1)
-	notify <- amqp.ErrClosed
+// channel 关闭、连接断开或停机时 ctx 被取消, 循环必须立即返回非 nil。
+func Test_deliveryLoop_ReturnsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 
-	err := consumeLoop(context.Background(), make(chan amqp.Delivery), notify, nil,
-		func(amqp.Delivery) {})
-	if err == nil {
+	if err := deliveryLoop(ctx, make(chan amqp.Delivery), nil, func(amqp.Delivery) {}); err == nil {
 		t.Fatal("expected non-nil error")
 	}
 }
 
-// notify 被关闭时也必须返回非 nil, 否则上层重连循环会空转。
-func Test_consumeLoop_ClosedNotifyReturnsError(t *testing.T) {
-	notify := make(chan *amqp.Error)
-	close(notify)
+// 已要求退出后, 即使通道里还有消息也不能再处理: 未 ack 的消息由 broker 重新入队。
+func Test_deliveryLoop_DoesNotProcessAfterCancel(t *testing.T) {
+	delivery := make(chan amqp.Delivery, 4)
+	for i := 0; i < 4; i++ {
+		delivery <- amqp.Delivery{}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 
-	if err := consumeLoop(context.Background(), make(chan amqp.Delivery), notify, nil,
-		func(amqp.Delivery) {}); err == nil {
-		t.Fatal("expected non-nil error on closed notify channel")
+	handled := 0
+	for i := 0; i < 50; i++ {
+		_ = deliveryLoop(ctx, delivery, nil, func(amqp.Delivery) { handled++ })
+	}
+	if handled != 0 {
+		t.Fatalf("handled %d messages after cancel", handled)
 	}
 }
 
-func Test_consumeLoop_NoLimiterProcessesAll(t *testing.T) {
+func Test_deliveryLoop_NoLimiterProcessesAll(t *testing.T) {
 	delivery := make(chan amqp.Delivery, 10)
 	for i := 0; i < 10; i++ {
 		delivery <- amqp.Delivery{}
@@ -64,7 +70,7 @@ func Test_consumeLoop_NoLimiterProcessesAll(t *testing.T) {
 	close(delivery)
 
 	handled := 0
-	_ = consumeLoop(context.Background(), delivery, make(chan *amqp.Error, 1), nil,
+	_ = deliveryLoop(context.Background(), delivery, nil,
 		func(amqp.Delivery) { handled++ })
 
 	if handled != 10 {
@@ -73,7 +79,7 @@ func Test_consumeLoop_NoLimiterProcessesAll(t *testing.T) {
 }
 
 // 真正验证限流生效: 窗口 100ms / 2 条, 在持续供给下 300ms 内不应放行过多。
-func Test_consumeLoop_LimitsThroughput(t *testing.T) {
+func Test_deliveryLoop_LimitsThroughput(t *testing.T) {
 	delivery := make(chan amqp.Delivery, 1024)
 	for i := 0; i < 1024; i++ {
 		delivery <- amqp.Delivery{}
@@ -85,7 +91,7 @@ func Test_consumeLoop_LimitsThroughput(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 
-	_ = consumeLoop(ctx, delivery, make(chan *amqp.Error, 1), limiter,
+	_ = deliveryLoop(ctx, delivery, limiter,
 		func(amqp.Delivery) { handled <- struct{}{} })
 
 	got := len(handled)
@@ -96,7 +102,7 @@ func Test_consumeLoop_LimitsThroughput(t *testing.T) {
 }
 
 // 限流器等待期间 ctx 结束时必须返回错误, 而不是阻塞或继续无节制消费。
-func Test_consumeLoop_ReturnsWhenLimiterContextDone(t *testing.T) {
+func Test_deliveryLoop_ReturnsWhenLimiterContextDone(t *testing.T) {
 	delivery := make(chan amqp.Delivery, 8)
 	for i := 0; i < 8; i++ {
 		delivery <- amqp.Delivery{}
@@ -108,7 +114,7 @@ func Test_consumeLoop_ReturnsWhenLimiterContextDone(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- consumeLoop(ctx, delivery, make(chan *amqp.Error, 1), limiter,
+		done <- deliveryLoop(ctx, delivery, limiter,
 			func(amqp.Delivery) {})
 	}()
 
@@ -118,6 +124,6 @@ func Test_consumeLoop_ReturnsWhenLimiterContextDone(t *testing.T) {
 			t.Fatal("expected non-nil error when limiter context expires")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("consumeLoop blocked forever on limiter")
+		t.Fatal("deliveryLoop blocked forever on limiter")
 	}
 }

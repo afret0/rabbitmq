@@ -12,9 +12,8 @@ const (
 type Queue struct {
 	Name     string
 	RouteKey string
-	// RetryQueue 是重试退避队列, 第 n 次重试等待 RetryQueue[n]。
-	// 单位为毫秒(与 AMQP 的 x-message-ttl 一致), 注意与 PublishDelay 的秒不同。
-	// 为空时不重试。
+	// Deprecated: 不再生效。Handle 返回 Retry 时统一按 1s / 5s / 10s 退避重投,
+	// 同一条消息最多重投 3 次, 之后丢弃(队列配置了死信则进入死信)并打印日志。
 	RetryQueue []int64
 	Handle     func([]byte) Status
 }
@@ -24,7 +23,6 @@ type Broker interface {
 	ConsumerTopic(opt *GroupConsumeOption, handle func([]byte) Status) error
 	Publish(ctx context.Context, key string, body []byte) error
 	// PublishDelay 延迟投递, delaySeconds 单位为秒。
-	// 注意与 Queue.RetryQueue 的单位(毫秒)不同。
 	PublishDelay(ctx context.Context, queue string, body []byte, delaySeconds int64) error
 	DeclareQueue(name, routingKey string) error
 	Health() bool
