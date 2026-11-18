@@ -29,6 +29,9 @@ type sessionSpec struct {
 	prefetch int
 	limiter  *rate.Limiter
 	handle   func([]byte) Status
+
+	broadcast       bool
+	broadcastHandle func(amqp.Delivery)
 }
 
 // deliveryLoop 逐条处理 delivery，直到 ctx 结束或投递通道关闭。
@@ -72,21 +75,26 @@ func (a *AmqpBroker) runSession(spec sessionSpec) error {
 	}
 
 	var ch *amqp.Channel
+	var queue string
 	if err := a.main.withWatchdog(gen, consumeSetupTimeout, "setup consumer "+spec.queue, func() (err error) {
-		ch, err = a.openConsumeChannel(conn, spec)
+		queue, ch, err = a.openConsumeChannel(conn, spec)
 		return err
 	}); err != nil {
 		return a.sessionErr(err)
 	}
 	defer closeChannel(ch)
 
-	retryReady := a.declareRetryTopology(conn, gen, spec.queue)
+	// 广播队列是 exclusive 的，只能在声明它的 channel 上绑定，独立 channel 上的重投拓扑必然 405，直接跳过
+	retryReady := false
+	if !spec.broadcast {
+		retryReady = a.declareRetryTopology(conn, gen, queue)
+	}
 
 	chClosed := ch.NotifyClose(make(chan *amqp.Error, 1))
-	tag := consumerTag(spec.queue)
+	tag := consumerTag(queue)
 	var deliveries <-chan amqp.Delivery
-	if err := a.main.withWatchdog(gen, consumeSetupTimeout, "consume "+spec.queue, func() (err error) {
-		deliveries, err = ch.Consume(spec.queue, tag, false, false, false, false, nil)
+	if err := a.main.withWatchdog(gen, consumeSetupTimeout, "consume "+queue, func() (err error) {
+		deliveries, err = ch.Consume(queue, tag, spec.broadcast, false, spec.broadcast, false, nil)
 		return err
 	}); err != nil {
 		return a.sessionErr(err)
@@ -108,25 +116,31 @@ func (a *AmqpBroker) runSession(spec sessionSpec) error {
 		}
 	}()
 
-	r := &redeliverer{
-		queue:  spec.queue,
-		handle: spec.handle,
-		wait:   func(d time.Duration) bool { return sleepCtx(ctx, d) },
-	}
-	if retryReady {
-		r.schedule = func(d amqp.Delivery, next int, delay time.Duration) error {
-			return a.scheduleRedelivery(spec.queue, d, next, delay)
+	var process func(amqp.Delivery)
+	if spec.broadcast {
+		process = spec.broadcastHandle
+	} else {
+		r := &redeliverer{
+			queue:  queue,
+			handle: spec.handle,
+			wait:   func(d time.Duration) bool { return sleepCtx(ctx, d) },
 		}
-		r.persist = func(d amqp.Delivery, next int, delay time.Duration) bool {
-			// 只在停机且 channel 仍可用时尝试：断线时原消息无法 ack，再发一份只会制造重复
-			if a.ctx.Err() == nil || chanClosed.Load() {
-				return false
+		if retryReady {
+			r.schedule = func(d amqp.Delivery, next int, delay time.Duration) error {
+				return a.scheduleRedelivery(queue, d, next, delay)
 			}
-			return a.scheduleRedelivery(spec.queue, d, next, delay) == nil
+			r.persist = func(d amqp.Delivery, next int, delay time.Duration) bool {
+				// 只在停机且 channel 仍可用时尝试：断线时原消息无法 ack，再发一份只会制造重复
+				if a.ctx.Err() == nil || chanClosed.Load() {
+					return false
+				}
+				return a.scheduleRedelivery(queue, d, next, delay) == nil
+			}
 		}
+		process = r.process
 	}
 
-	err = deliveryLoop(ctx, deliveries, spec.limiter, r.process)
+	err = deliveryLoop(ctx, deliveries, spec.limiter, process)
 	if !chanClosed.Load() {
 		// 在途消息此时已处理完并确认。先取消订阅再关闭 channel：阿里云 RabbitMQ 版在 basic.cancel 时
 		// 立即把已投递未确认的预取消息重新入队，而仅关闭连接时要等消费超时（默认 5 分钟）才重投。
@@ -143,17 +157,27 @@ func (a *AmqpBroker) runSession(spec sessionSpec) error {
 	}
 }
 
-func (a *AmqpBroker) openConsumeChannel(conn *amqp.Connection, spec sessionSpec) (*amqp.Channel, error) {
+func (a *AmqpBroker) openConsumeChannel(conn *amqp.Connection, spec sessionSpec) (string, *amqp.Channel, error) {
 	ch, err := conn.Channel()
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	fail := func(err error) (*amqp.Channel, error) {
+	fail := func(err error) (string, *amqp.Channel, error) {
 		go ch.Close()
-		return nil, err
+		return "", nil, err
 	}
 	if err := ch.ExchangeDeclare(a.options.Exchange, a.options.ExchangeType, true, false, false, false, nil); err != nil {
 		return fail(err)
+	}
+	if spec.broadcast {
+		q, err := ch.QueueDeclare("", false, true, true, false, nil)
+		if err != nil {
+			return fail(err)
+		}
+		if err := ch.QueueBind(q.Name, "", a.options.Exchange, false, nil); err != nil {
+			return fail(err)
+		}
+		return q.Name, ch, nil
 	}
 	if _, err := ch.QueueDeclare(spec.queue, true, false, false, false, nil); err != nil {
 		return fail(err)
@@ -166,7 +190,7 @@ func (a *AmqpBroker) openConsumeChannel(conn *amqp.Connection, spec sessionSpec)
 			return fail(err)
 		}
 	}
-	return ch, nil
+	return spec.queue, ch, nil
 }
 
 // declareRetryTopology 声明重投 exchange 并把队列以自身名字绑定上去。

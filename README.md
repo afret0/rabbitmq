@@ -117,6 +117,29 @@ rabbitmq: drop message after 3 redeliveries (max 3): queue=order-queue exchange=
 consumer.LaunchTopicJob("order-group", "order.*", job)
 ```
 
+## 广播（fanout，语义对齐 redis pubsub）
+
+需要**每个在线实例都收到全量消息**（如跨实例通知总线）时，用广播原语，而不是给每个实例造一个 group：
+
+```go
+// exchange 必须是 fanout
+opt := &rabbitmq.ExchangeOption{Name: "im-bus", Type: "fanout"}
+producer := rabbitmq.NewProducer(&rabbitmq.ProducerOptions{ExchangeOpt: opt, BrokerURL: url})
+consumer := rabbitmq.NewConsumer(&rabbitmq.ConsumerOptions{ExchangeOpt: opt, BrokerURL: url})
+
+go consumer.LaunchBroadcastJob(func(ctx context.Context, body []byte) {
+    // body 是发布方的原始字节，没有 Message 信封；ctx 的 opId 来自发布方写入的 AMQP header
+})
+
+_ = producer.PublishBroadcast(ctx, data) // string 原样发送，其余 JSON 序列化
+```
+
+- 每个实例独享一个 server-named 的**非持久 / exclusive / auto-delete** 临时队列，实例下线队列即消失，broker 上不留垃圾。
+- auto-ack、无重投：handler panic 记日志后丢弃该条消息，不影响后续消息。
+- 发布 transient + `mandatory=false`：**无订阅者时消息被丢弃且返回 nil**，不会报 unroutable。
+- 断线后重建的是全新队列，**断线期间的消息不补发**——与 redis pubsub 一致。不能丢消息的场景请用 `LaunchJob` / `LaunchTopicJob`。
+- 不创建重投拓扑与延迟队列；不逐条开 trace span（发布侧 `TRACE` 开启时有 producer span）。
+
 ## 生产端预声明队列
 
 消息发出时若没有任何队列绑定该 routing key，broker 会直接丢弃。建议启动时预声明：
@@ -177,6 +200,7 @@ _ = producer.Close()
 | exchange `afret0.rabbitmq.retry`（direct，持久化） | 重投消息回到原队列的通道，每个消费队列以自身名字绑定 |
 | 队列 `delay.v1.<1s\|5s\|10s>.<队列名>`（持久化） | 重投用的延迟队列，闲置 7 天后由 broker 自动删除 |
 | 队列 `delay.<秒>.<exchange>.<routingKey>` | `PublishDelay` 的延迟队列（与旧版本相同） |
+| server-named 临时队列（非持久 / exclusive / auto-delete） | `LaunchBroadcastJob` / `ConsumerBroadcast` 每个实例一个，实例下线自动删除，无需权限放行 |
 
 如果 RabbitMQ 账号的 configure 权限受限，需放行上述名字；未放行时失败消息退化为进程内重试，规则不变。
 

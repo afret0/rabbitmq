@@ -15,6 +15,7 @@ import (
 	"github.com/afret0/wheel/tool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
+	"github.com/streadway/amqp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -309,6 +310,28 @@ func (c *Consumer) LaunchTopicJob(group string, topic string, job Job) {
 
 	c.runForever(fmt.Sprintf("group: %s, topic: %s, hostId: %s,", group, topic, hostId), func() error {
 		return c.broker.ConsumerTopic(opt, handle)
+	})
+}
+
+// LaunchBroadcastJob 以广播方式消费：每个实例独享临时独占队列，所有实例都收到全量消息。
+// 消息体是发布方的原始字节，没有 Message 信封；ctx 的 opId 取自 AMQP header（发布方写入）。
+// handler panic 时打印日志并丢弃该条消息，不重投；断线后重建新队列，断线期间的消息不补发。
+// 语义对齐 redis pubsub，适合跨实例通知总线，不适合不能丢消息的场景。
+// 阻塞直到 Shutdown。要求 ExchangeOpt.Type 为 fanout。
+func (c *Consumer) LaunchBroadcastJob(f func(ctx context.Context, body []byte)) {
+	handle := func(headers amqp.Table, body []byte) {
+		ctx := context.Background()
+		if opId, ok := headers["opId"].(string); ok && opId != "" {
+			ctx = context.WithValue(ctx, "opId", opId)
+		}
+		if tool.Debug() {
+			lg := log2.CtxLogger(ctx).WithFields(logrus.Fields{})
+			lg.Infof("recv, hostId: %s, body: %s", hostId, body)
+		}
+		f(ctx, body)
+	}
+	c.runForever(fmt.Sprintf("broadcast hostId: %s", hostId), func() error {
+		return c.broker.ConsumerBroadcast(handle)
 	})
 }
 

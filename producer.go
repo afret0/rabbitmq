@@ -65,6 +65,24 @@ func (p *Producer) PublishDelay(ctx context.Context, key string, data interface{
 	return p.broker.PublishDelay(ctx, key, body, delaySeconds)
 }
 
+// PublishBroadcast 广播消息到 fanout exchange，所有在线订阅实例各收到一份；
+// 无订阅者时消息被丢弃且返回 nil。断线不补发，语义对齐 redis pubsub。
+// 要求 ExchangeOpt.Type 为 fanout。
+func (p *Producer) PublishBroadcast(ctx context.Context, data interface{}) error {
+	var body []byte
+	switch d := data.(type) {
+	case string:
+		body = []byte(d)
+	default:
+		b, err := json.Marshal(data)
+		if err != nil {
+			return err
+		}
+		body = b
+	}
+	return p.broker.PublishBroadcast(ctx, body)
+}
+
 // Close 关闭连接，最多等待 10s。之后 Publish 返回错误。
 func (p *Producer) Close() error {
 	if c, ok := p.broker.(interface{ Close() error }); ok {

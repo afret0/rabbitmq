@@ -1,6 +1,10 @@
 package broker
 
-import "context"
+import (
+	"context"
+
+	"github.com/streadway/amqp"
+)
 
 type Status int
 
@@ -21,9 +25,11 @@ type Queue struct {
 type Broker interface {
 	Consume(queue *Queue, optChain ...*ConsumeOption) error
 	ConsumerTopic(opt *GroupConsumeOption, handle func([]byte) Status) error
+	ConsumerBroadcast(handle func(headers amqp.Table, body []byte)) error
 	Publish(ctx context.Context, key string, body []byte) error
 	// PublishDelay 延迟投递, delaySeconds 单位为秒。
 	PublishDelay(ctx context.Context, queue string, body []byte, delaySeconds int64) error
+	PublishBroadcast(ctx context.Context, body []byte) error
 	DeclareQueue(name, routingKey string) error
 	Health() bool
 }

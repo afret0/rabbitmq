@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -116,6 +117,36 @@ func (a *AmqpBroker) ConsumerTopic(opt *GroupConsumeOption, handle func([]byte) 
 		bindings: opt.RoutingKeys,
 		prefetch: prefetch,
 		handle:   h,
+	})
+}
+
+// ConsumerBroadcast 以广播方式消费：每个实例独享一个 server-named 的非持久 / exclusive / auto-delete
+// 临时队列，绑定到 fanout exchange，所有实例都收到全量消息。auto-ack、无重投拓扑，
+// 断线后重建的是全新队列，断线期间的消息不补发——语义与 redis pubsub 对齐。
+//
+// 要求 Options.ExchangeType 为 fanout。handler panic 时打印日志并丢弃该条消息。
+// 返回值语义同 Consume（断线返回非 nil error 由调用方重建，Shutdown 返回 ErrShutdown）。
+func (a *AmqpBroker) ConsumerBroadcast(handle func(headers amqp.Table, body []byte)) error {
+	if handle == nil {
+		return fmt.Errorf("broadcast handle nil")
+	}
+	h := handle
+	if os.Getenv("DEBUG") == "TRUE" {
+		h = func(headers amqp.Table, body []byte) {
+			log.Printf("AmqpBroker ConsumerBroadcast receive msg: %s", body)
+			handle(headers, body)
+		}
+	}
+	return a.runSession(sessionSpec{
+		broadcast: true,
+		broadcastHandle: func(d amqp.Delivery) {
+			defer func() {
+				if p := recover(); p != nil {
+					log.Printf("rabbitmq: broadcast handler panic: %v\n%s", p, debug.Stack())
+				}
+			}()
+			h(d.Headers, d.Body)
+		},
 	})
 }
 
@@ -232,6 +263,32 @@ func (a *AmqpBroker) Publish(ctx context.Context, key string, body []byte) error
 			ContentType:  "",
 			Body:         body,
 			DeliveryMode: amqp.Persistent,
+		},
+	})
+}
+
+// PublishBroadcast 广播一条消息：transient + mandatory=false，无订阅者时 broker 直接确认并丢弃，
+// 返回 nil（与 redis pubsub 无订阅者的语义一致）。要求 exchange 为 fanout。
+func (a *AmqpBroker) PublishBroadcast(ctx context.Context, body []byte) error {
+	opId := tool.OpId(ctx)
+	if tool.EnvEnabled("TRACE") {
+		tracer := otel.Tracer("rabbitmq")
+		_, span := tracer.Start(ctx, "rabbitmq.PublishBroadcast")
+		defer span.End()
+		span.SetAttributes(
+			attribute.String("exchange", a.options.Exchange),
+			attribute.String("exchange_type", a.options.ExchangeType),
+			attribute.String("opId", opId),
+		)
+	}
+	return a.producerPublisher().publish(ctx, pubRequest{
+		exchange:  a.options.Exchange,
+		key:       "",
+		mandatory: false,
+		msg: amqp.Publishing{
+			Headers:      amqp.Table{"opId": opId},
+			Body:         body,
+			DeliveryMode: amqp.Transient,
 		},
 	})
 }

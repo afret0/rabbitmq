@@ -1318,3 +1318,127 @@ func TestIT_NoGoroutineLeakAfterShutdown(t *testing.T) {
 	waitFor(t, 15*time.Second, func() bool { return runtime.NumGoroutine() <= baseline+2 },
 		"goroutines %d > baseline %d", runtime.NumGoroutine(), baseline)
 }
+
+// ---------------------------------------------------------------------------
+// 广播（fanout + 临时独占队列）
+// ---------------------------------------------------------------------------
+
+func broadcastForever(b *AmqpBroker, h func(amqp.Table, []byte)) {
+	go func() {
+		for {
+			start := time.Now()
+			err := b.ConsumerBroadcast(h)
+			if errors.Is(err, ErrShutdown) {
+				return
+			}
+			log.Printf("test: broadcast session ended after %v: %v", time.Since(start).Round(time.Millisecond), err)
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+}
+
+func broadcastOK(t *testing.T, b *AmqpBroker, body string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := b.PublishBroadcast(ctx, []byte(body)); err != nil {
+		t.Fatalf("broadcast %s: %v", body, err)
+	}
+}
+
+func TestIT_BroadcastFanoutAllInstances(t *testing.T) {
+	requireBroker(t)
+	adm := newAdmin(t)
+	ex := testName(t, "ex")
+	adm.cleanup(ex)
+	prod := newBroker(t, itURL, ex, "fanout")
+
+	broadcastOK(t, prod, "no-subscriber")
+
+	rec1, rec2 := newRecorder(), newRecorder()
+	broadcastForever(newBroker(t, itURL, ex, "fanout"), func(_ amqp.Table, b []byte) { rec1.add(b) })
+	broadcastForever(newBroker(t, itURL, ex, "fanout"), func(_ amqp.Table, b []byte) { rec2.add(b) })
+	waitFor(t, 20*time.Second, func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := prod.PublishBroadcast(ctx, []byte("warmup"))
+		cancel()
+		if err != nil {
+			log.Printf("test: warmup publish: %v", err)
+		}
+		time.Sleep(300 * time.Millisecond)
+		return rec1.count("warmup") >= 1 && rec2.count("warmup") >= 1
+	}, "consumers not ready")
+
+	base1, base2 := rec1.sum(), rec2.sum()
+	for i := 0; i < 5; i++ {
+		broadcastOK(t, prod, fmt.Sprintf("b-%d", i))
+	}
+	waitFor(t, 20*time.Second, func() bool { return rec1.sum() >= base1+5 && rec2.sum() >= base2+5 },
+		"broadcast messages not fully delivered")
+	time.Sleep(500 * time.Millisecond)
+	if rec1.sum() != base1+5 || rec2.sum() != base2+5 {
+		t.Fatalf("each instance must get every message exactly once: r1=%d r2=%d", rec1.sum()-base1, rec2.sum()-base2)
+	}
+	if rec1.count("no-subscriber") != 0 || rec2.count("no-subscriber") != 0 {
+		t.Fatal("message published before subscribers must not be replayed")
+	}
+}
+
+func TestIT_BroadcastPanicDropsAndContinues(t *testing.T) {
+	requireBroker(t)
+	logs := captureLog(t)
+	adm := newAdmin(t)
+	ex := testName(t, "ex")
+	adm.cleanup(ex)
+	prod := newBroker(t, itURL, ex, "fanout")
+	rec := newRecorder()
+	broadcastForever(newBroker(t, itURL, ex, "fanout"), func(_ amqp.Table, b []byte) {
+		if string(b) == "boom" {
+			panic("boom")
+		}
+		rec.add(b)
+	})
+	waitFor(t, 20*time.Second, func() bool {
+		broadcastOK(t, prod, "warmup")
+		time.Sleep(300 * time.Millisecond)
+		return rec.count("warmup") >= 1
+	}, "consumer not ready")
+
+	base := rec.sum()
+	broadcastOK(t, prod, "boom")
+	broadcastOK(t, prod, "ok-1")
+	broadcastOK(t, prod, "ok-2")
+	waitFor(t, 20*time.Second, func() bool { return rec.count("ok-1") >= 1 && rec.count("ok-2") >= 1 },
+		"messages after panic not delivered")
+	time.Sleep(500 * time.Millisecond)
+	if rec.count("boom") != 0 || rec.count("ok-1") != 1 || rec.count("ok-2") != 1 || rec.sum() != base+2 {
+		t.Fatalf("panicking message must be dropped without retry: total=%d boom=%d", rec.sum()-base, rec.count("boom"))
+	}
+	if !strings.Contains(logs.String(), "broadcast handler panic") {
+		t.Fatal("expected panic log")
+	}
+}
+
+func TestIT_BroadcastReconnectFreshQueue(t *testing.T) {
+	requireBroker(t)
+	adm := newAdmin(t)
+	ex := testName(t, "ex")
+	adm.cleanup(ex)
+	proxy, purl := proxied(t)
+	prod := newBroker(t, itURL, ex, "fanout")
+	rec := newRecorder()
+	broadcastForever(newBroker(t, purl, ex, "fanout"), func(_ amqp.Table, b []byte) { rec.add(b) })
+	waitFor(t, 20*time.Second, func() bool {
+		broadcastOK(t, prod, "before")
+		time.Sleep(300 * time.Millisecond)
+		return rec.count("before") >= 1
+	}, "baseline not delivered")
+
+	proxy.ResetAll()
+
+	waitFor(t, 60*time.Second, func() bool {
+		broadcastOK(t, prod, "after")
+		time.Sleep(time.Second)
+		return rec.count("after") >= 1
+	}, "consumer did not resume with a fresh queue after reset")
+}

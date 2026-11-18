@@ -332,3 +332,75 @@ func TestE2E_PublishDelay(t *testing.T) {
 		t.Fatal("delayed message not delivered")
 	}
 }
+
+func TestE2E_BroadcastJob(t *testing.T) {
+	ex, _ := names(t)
+	producer, c1 := newPair(t, ex, "fanout")
+	c2 := rabbitmq.NewConsumer(&rabbitmq.ConsumerOptions{
+		ExchangeOpt: &rabbitmq.ExchangeOption{Name: ex, Type: "fanout"},
+		BrokerURL:   brokerURL,
+	})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = c2.Shutdown(ctx)
+	})
+
+	var n1, n2 atomic.Int32
+	var opIds sync.Map
+	done := make(chan struct{}, 2)
+	go func() {
+		c1.LaunchBroadcastJob(func(ctx context.Context, body []byte) {
+			n1.Add(1)
+			if id, _ := ctx.Value("opId").(string); id != "" {
+				opIds.Store(id, true)
+			}
+		})
+		done <- struct{}{}
+	}()
+	go func() {
+		c2.LaunchBroadcastJob(func(_ context.Context, _ []byte) { n2.Add(1) })
+		done <- struct{}{}
+	}()
+
+	if err := producer.PublishBroadcast(context.Background(), "no-subscriber"); err != nil {
+		t.Fatalf("publish without subscribers must succeed: %v", err)
+	}
+
+	waitFor(t, 20*time.Second, func() bool {
+		if err := producer.PublishBroadcast(context.Background(), "warmup"); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(300 * time.Millisecond)
+		return n1.Load() >= 1 && n2.Load() >= 1
+	}, fmt.Sprintf("consumers not ready: c1=%d c2=%d", n1.Load(), n2.Load()))
+
+	base1, base2 := n1.Load(), n2.Load()
+	for i := 0; i < 3; i++ {
+		if err := producer.PublishBroadcast(context.Background(), map[string]int{"i": i}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, 15*time.Second, func() bool { return n1.Load() == base1+3 && n2.Load() == base2+3 },
+		fmt.Sprintf("c1=%d c2=%d", n1.Load(), n2.Load()))
+	time.Sleep(time.Second)
+	if n1.Load() != base1+3 || n2.Load() != base2+3 {
+		t.Fatalf("each instance must receive each message once: c1=%d c2=%d", n1.Load(), n2.Load())
+	}
+	nIds := 0
+	opIds.Range(func(_, _ any) bool { nIds++; return true })
+	if nIds == 0 {
+		t.Fatal("handler ctx must carry publisher opId")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c1.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("LaunchBroadcastJob did not return after Shutdown")
+	}
+}
