@@ -150,6 +150,38 @@ func (a *AmqpBroker) ConsumerBroadcast(handle func(headers amqp.Table, body []by
 	})
 }
 
+// ConsumerDirected 以定向广播方式消费：每个实例独享临时独占队列（server-named、非持久、自动删），
+// 队列以 routingKey 绑定到配置的 exchange（应为 direct/topic），broker 只把匹配 routingKey 的消息投给本实例。
+// 与 ConsumerBroadcast 共用独占自动删 + auto-ack + 断线重建新队列语义，区别仅在绑定键不为空：
+// 目标实例不在（队列已随断连自动删除）时消息 unroutable 直接丢弃，适合可丢的定向通知。
+func (a *AmqpBroker) ConsumerDirected(routingKey string, handle func(headers amqp.Table, body []byte)) error {
+	if routingKey == "" {
+		return fmt.Errorf("directed routingKey empty")
+	}
+	if handle == nil {
+		return fmt.Errorf("directed handle nil")
+	}
+	h := handle
+	if os.Getenv("DEBUG") == "TRUE" {
+		h = func(headers amqp.Table, body []byte) {
+			log.Printf("AmqpBroker ConsumerDirected receive msg: %s", body)
+			handle(headers, body)
+		}
+	}
+	return a.runSession(sessionSpec{
+		broadcast: true,
+		bindKey:   routingKey,
+		broadcastHandle: func(d amqp.Delivery) {
+			defer func() {
+				if p := recover(); p != nil {
+					log.Printf("rabbitmq: directed handler panic: %v\n%s", p, debug.Stack())
+				}
+			}()
+			h(d.Headers, d.Body)
+		},
+	})
+}
+
 func (a *AmqpBroker) scheduleRedelivery(queue string, d amqp.Delivery, next int, delay time.Duration) error {
 	pub, err := a.retryPublisher()
 	if err != nil {

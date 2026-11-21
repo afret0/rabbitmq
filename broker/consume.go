@@ -32,6 +32,7 @@ type sessionSpec struct {
 
 	broadcast       bool
 	broadcastHandle func(amqp.Delivery)
+	bindKey         string
 }
 
 // deliveryLoop 逐条处理 delivery，直到 ctx 结束或投递通道关闭。
@@ -174,7 +175,7 @@ func (a *AmqpBroker) openConsumeChannel(conn *amqp.Connection, spec sessionSpec)
 		if err != nil {
 			return fail(err)
 		}
-		if err := ch.QueueBind(q.Name, "", a.options.Exchange, false, nil); err != nil {
+		if err := ch.QueueBind(q.Name, spec.bindKey, a.options.Exchange, false, nil); err != nil {
 			return fail(err)
 		}
 		return q.Name, ch, nil

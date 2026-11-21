@@ -26,6 +26,7 @@ type Broker interface {
 	Consume(queue *Queue, optChain ...*ConsumeOption) error
 	ConsumerTopic(opt *GroupConsumeOption, handle func([]byte) Status) error
 	ConsumerBroadcast(handle func(headers amqp.Table, body []byte)) error
+	ConsumerDirected(routingKey string, handle func(headers amqp.Table, body []byte)) error
 	Publish(ctx context.Context, key string, body []byte) error
 	// PublishDelay 延迟投递, delaySeconds 单位为秒。
 	PublishDelay(ctx context.Context, queue string, body []byte, delaySeconds int64) error

@@ -335,6 +335,30 @@ func (c *Consumer) LaunchBroadcastJob(f func(ctx context.Context, body []byte)) 
 	})
 }
 
+// LaunchDirectedJob 以定向广播方式消费：每个实例独享临时独占队列（server-named、非持久、自动删），
+// 队列以 routingKey 绑定到配置的 exchange（应为 direct/topic），只收到匹配 routingKey 的消息。
+// 消息体是发布方原始字节，没有 Message 信封；ctx 的 opId 取自 AMQP header。
+// handler panic 时打印日志并丢弃，不重投；断线后重建新队列，断线期间消息不补发；
+// 本实例不在（队列已自动删）时发布方消息 unroutable 直接丢。语义对齐 redis 按节点 channel 订阅，
+// 适合可丢的定向通知（如按 nodeId 投到目标网关），不适合不能丢消息的场景。
+// 阻塞直到 Shutdown。routingKey 不能为空。
+func (c *Consumer) LaunchDirectedJob(routingKey string, f func(ctx context.Context, body []byte)) {
+	handle := func(headers amqp.Table, body []byte) {
+		ctx := context.Background()
+		if opId, ok := headers["opId"].(string); ok && opId != "" {
+			ctx = context.WithValue(ctx, "opId", opId)
+		}
+		if tool.Debug() {
+			lg := log2.CtxLogger(ctx).WithFields(logrus.Fields{})
+			lg.Infof("recv, hostId: %s, routingKey: %s, body: %s", hostId, routingKey, body)
+		}
+		f(ctx, body)
+	}
+	c.runForever(fmt.Sprintf("directed hostId: %s routingKey: %s", hostId, routingKey), func() error {
+		return c.broker.ConsumerDirected(routingKey, handle)
+	})
+}
+
 // runForever 反复执行一次消费会话，直到 Shutdown。
 // 会话运行超过 1 分钟视为稳定，退避从头开始；否则逐步拉长，避免持续失败时空转、
 // 以及 broker 重启后所有 Pod 同时重建消费造成惊群。
